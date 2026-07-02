@@ -1,0 +1,43 @@
+# 神奈川基準線の検証コード（非破壊チェック）
+
+## これは何か
+検算エンジン（ingest）や共有ファイルを変更したとき、**既存の正しい挙動を壊していないか**を
+機械的に確認するための基準線。神奈川厚生福祉会（全12様式の手書きデータ）を取り込んだ結果が
+固定値（fact 3,326行 / 特定のsha256 / 検算NG=0）になることを利用する。
+
+## 鉄則
+- **エンジンや共有ファイルを触ったら、毎回このコードを実行して一致を確認する。**
+- 一致しなくなったら、その変更は採番順・出力順・値を変えている（＝既存を壊した）サイン。
+- 採番順・出力順は変えない。挙動だけ直す。
+
+## 検証コード（deliver直下で実行）
+```python
+import hashlib
+from shafuku_db_engine.corps.kanagawa import CORP
+from shafuku_db_engine.ingest import ingest
+
+ing = ingest(CORP)
+blob = '\n'.join('|'.join(str(x) for x in row) for row in ing.fact)
+sha = hashlib.sha256(blob.encode('utf-8')).hexdigest()
+assert len(ing.fact) == 3326, f'fact行数が違う: {len(ing.fact)}'
+assert sha == '0aa61d8b7c250c447e39688d9b8b38fe665c6f3812fbdc5bc490f5101f102e54', f'sha256が違う: {sha}'
+print('OK: 神奈川基準線一致（非破壊）')
+```
+
+## 算出仕様（この手順以外では値が一致しないので注意）
+- 対象は `ingest(CORP).fact`（CSVではなくメモリ上のリスト）。
+- セル内区切り = `|`（半角パイプ）、各セルは `str(x)` で変換（None→文字列 'None'）。
+- 行間区切り = `\n`（LF）、末尾に改行は付けない（joinのみ）。
+- 行の順序は `ing.fact` が返す順序のまま（ソートしない）。
+- エンコード = UTF-8、`hashlib.sha256(...).hexdigest()`。
+
+## 期待値
+- fact行数: **3,326**
+- sha256: **0aa61d8b7c250c447e39688d9b8b38fe665c6f3812fbdc5bc490f5101f102e54**
+- validate（検算）: **NG=0**（`python3 -m shafuku_db_engine validate corps.kanagawa` でオールパス）
+
+## 補足
+- CSVファイルをハッシュしても上の値とは一致しない（CSV化の区切り・引用符・None変換で変わるため）。
+  必ず上記の「メモリ上 ing.fact をパイプ結合」手順で算出すること。
+- この基準線は「壊れていないこと」の保証であって、「正しいことすべて」の保証ではない。
+  新機能の正しさは別途検証が必要。
