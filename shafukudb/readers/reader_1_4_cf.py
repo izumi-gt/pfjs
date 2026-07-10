@@ -1,63 +1,142 @@
-"""様式1-4(拠点区分 資金収支計算書)専用の読み取り機。
+"""様式1-4(拠点区分 資金収支計算書・CF)専用の読み取り機。
 
-抽出層のみを担当する。code照合・NANIKA/UNRESOLVED判定・集計検算は
-matching.matcher に委譲する(様式非依存のため)。
+■ 照合アーキテクチャ(フェーズ2-4で確定)
+1-4は最も複雑な様式のため、1-1/1-2/1-3が共有する run_match(位置照合)では
+「事業区分をまたぐ同名科目の帰属」「(何)プレースホルダ帰属」を正しく解けない。
+そこで 1-4 は run_match を使わず、本ファイル内に自己完結した「階層照合方式」を持つ。
+これにより run_match には一切手を加えず、1-1/1-2/1-3 の既存動作は無傷のまま保たれる。
+(照合層の一本化は見送り。1-4のみ独自方式という結論。)
 
-確立した方針(フェーズ2-3):
-- 縦書き軸帯(L1/L2)は読まない。改ページでのセル分断・見えない重複文字により、
-  座標ベースでは原理的に読めないため。横書き科目名だけを上から順に読む。
-- 左端2列(x0=40-50)に混入する縦書き残骸(17文字セット)は、先頭1-3文字目に限り除去する。
-- ヘッダー除外・拠点境界検出はページ構造(罫線・見出し語)で判定し、座標固定値には依存しない。
+■ 階層照合方式の骨子
+縦罫線で決まるインデント段(ゾーンC内のx0段)を、マスタ階層に対応づけて照合する。
+- インデント0: まず L2集計科目(収入計/支出計/差額 等) → L3実名 → L3(何)接尾辞帰属 → 法人特有
+- インデント1: 直前にヒットしたL3の「子(L4)」の範囲で 実名 → (何)子 → 法人特有
+- インデント2: 直前にヒットしたL4の「子(L5)」の範囲で 実名 → (何)子 → 法人特有
+親は必ず1周先に確定してから子・孫を照合する(親の子に限定)。
 
-本reader固有の座標定数(x0境界・金額列位置・改ページ挙動)は様式1-4専用であり、
-他様式(1-2, 2-4等)では別途実測してreaderを新規実装すること。
+■ L3(何)接尾辞帰属(インデント0でL3実名に当たらないとき)
+科目名の末尾で(何)L3に帰属先を決める(収入/支出の軸を縦書きから読まずに判定できる):
+  末尾4文字が「事業収入」→ (何)事業収入 / 「事業収益」→ (何)事業収益
+  末尾2文字が「収入」→ (何)収入 / 「支出」→ (何)支出 / 「収益」→ (何)収益
+  いずれにも該当しなければ法人特有。
+例: 県立施設運営事業収入→(何)事業収入(017) / 県納付金支出→(何)支出(006)
+
+■ 見出し＋明細の同額2段組(1-4特有)
+内訳を1つしか持たない集計科目は「見出し(x0浅)＋明細(x0深)」が同額で2段表示される。
+階層照合では、明細側(次インデント)がマスタに子を持たない科目(繰入金等)のとき
+「子の範囲に実名なし・(何)なし」で自然に法人特有へ落ち、二重計上が構造的に防がれる。
+マスタに子がある科目(居宅介護支援介護料収入等)は明細が正しく子codeへHITする。
+
+■ 変わらない1-4固有の抽出方針(フェーズ2-3)
+- 縦書き軸帯(L1=活動・部/L2=収入・支出)は読まない。ゾーンC(x0>=60)の横書き科目のみ。
+- ヘッダー除外・拠点境界検出はページ構造(罫線・見出し語)で判定。
+- 半角括弧はマスタ表記(全角)へ正規化。
 """
-import sys
+import csv
+import json
+from collections import defaultdict
 from pathlib import Path
 
 import pdfplumber
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from matching.matcher import run_match_subjects, verify_totals, write_csv  # noqa: E402
+MASTER_PATH = Path(__file__).resolve().parent / 'seiten_master_v3.csv'
+if not MASTER_PATH.exists():
+    MASTER_PATH = Path(__file__).resolve().parent.parent / 'seiten_master_v3.csv'
 
-AXIS_CHARS = set("事業活動施設整等そのに他よる収支")
-
-AMOUNT_COLUMNS = [
-    ('予算A', 255.0, 331.0),
-    ('決算B', 331.0, 407.0),
-    ('差異AB', 407.0, 483.0),
-    ('備考', 483.0, 560.0),
-]
+AMOUNT_COLUMNS = [('予算A', 255, 331), ('決算B', 331, 407), ('差異AB', 407, 483), ('備考', 483, 560)]
 
 
-def clean_axis_contamination(text):
-    """先頭1〜3文字目の中にある17文字セット文字だけを除去する。
-    正規の科目名本体(4文字目以降)には手を出さない。混入は必ず先頭1-3文字目に限定される。"""
-    head = text[:3]
-    rest = text[3:]
-    cleaned_head = ''.join(ch for ch in head if ch not in AXIS_CHARS)
-    return cleaned_head + rest
+# ---------------- マスタ ----------------
+def load_master_cf(master_path=None):
+    with open(master_path or MASTER_PATH, encoding='utf-8-sig', newline='') as f:
+        return [r for r in csv.DictReader(f) if r['L0コード'] == 'CF']
 
 
-def is_axis_residue(text):
-    """17文字セット以外の文字を一切含まない=縦書き軸帯の残骸そのもの。"""
-    return all(ch in AXIS_CHARS for ch in text)
+CF = load_master_cf()
 
 
-def detect_facility_boundaries(pdf):
-    """拠点境界(様式先頭ページ)を検出。top<80に'拠点区分'を含む語があるページ。"""
-    boundaries = []
-    for pi, p in enumerate(pdf.pages):
-        words = p.extract_words()
-        hdr = [w for w in words if w['top'] < 80 and '拠点区分' in w['text']]
-        if hdr:
-            boundaries.append((pi, hdr[0]['text']))
-    return boundaries
+def leaf_name(r):
+    for i in range(5, 0, -1):
+        if r[f'L{i}科目']:
+            return r[f'L{i}科目']
+    return ''
 
 
+def _seg(code):
+    return code.split('-')[1:]
+
+
+def code_depth(code):
+    d = 0
+    for i, s in enumerate(_seg(code)):
+        if s not in ('000', '00'):
+            d = i + 1
+    return d
+
+
+def is_nanika(name):
+    return '（何）' in name
+
+
+def parse_amount(s):
+    if s is None or s == '':
+        return None
+    return int(s.replace(',', '').replace('△', '-').replace('▲', '-').replace(' ', ''))
+
+
+def normalize_name(t):
+    return t.replace('(', '（').replace(')', '）')
+
+
+# 深さ別index・子探索
+BY_DEPTH = defaultdict(list)
+for _j, _r in enumerate(CF):
+    BY_DEPTH[code_depth(_r['code'])].append(_j)
+
+
+def children_of(parent_idx):
+    """CF[parent_idx]の直接の子(深さ+1・上位セグメント一致)のindexリスト。"""
+    pc = CF[parent_idx]['code']
+    ps = _seg(pc)
+    pl = code_depth(pc)
+    return [j for j in BY_DEPTH[pl + 1] if _seg(CF[j]['code'])[:pl] == ps[:pl]]
+
+
+# インデント0で使う: L2集計名・L3実名の索引
+L2_NAME = defaultdict(list)
+L3_NAME = defaultdict(list)
+for _j in BY_DEPTH[2]:
+    L2_NAME[leaf_name(CF[_j])].append(_j)
+for _j in BY_DEPTH[3]:
+    L3_NAME[leaf_name(CF[_j])].append(_j)
+
+# L3(何)の接尾辞→index
+NANIKA_L3 = {}
+for _j in BY_DEPTH[3]:
+    _n = leaf_name(CF[_j])
+    if _n == '（何）事業収入':
+        NANIKA_L3['事業収入'] = _j
+    elif _n == '（何）事業収益':
+        NANIKA_L3['事業収益'] = _j
+    elif _n == '（何）収入':
+        NANIKA_L3['収入'] = _j
+    elif _n == '（何）支出':
+        NANIKA_L3['支出'] = _j
+    elif _n == '（何）収益':
+        NANIKA_L3['収益'] = _j
+
+
+def nanika_l3_for(name):
+    """L3実名に当たらない科目を、接尾辞で(何)L3へ帰属。該当なしはNone(法人特有)。"""
+    if name[-4:] in ('事業収入', '事業収益'):
+        return NANIKA_L3.get(name[-4:])
+    if name[-2:] in ('収入', '支出', '収益'):
+        return NANIKA_L3.get(name[-2:])
+    return None
+
+
+# ---------------- 抽出(ゾーンC) ----------------
 def page_table_top(p):
-    """このページの表開始top。外枠由来の横線が2本(105付近, 116付近)あれば
-    ヘッダー付きページなので2本目(116.1相当)を返す。1本以下なら継続ページとして0。"""
     h_outer = [r['top'] for r in p.rects if r['height'] < 1.0 and abs(r['x0'] - 39.7) < 0.5]
     h_outer = sorted(set(round(t, 1) for t in h_outer))
     if len(h_outer) >= 2 and h_outer[1] - h_outer[0] < 20:
@@ -65,137 +144,185 @@ def page_table_top(p):
     return 0
 
 
-def extract_pdf_subjects_multi(pdf_path, page_range):
-    """複数ページにわたる横書き科目名抽出。page_range: 対象ページindexのリスト。"""
-    pdf = pdfplumber.open(pdf_path)
-    subjects = []
+def extract_zoneC(pdf, page_range):
+    """ゾーンC(x0>=60、横書き科目名)を上から順に、金額4列付きで抽出。"""
+    rows = []
     for pi in page_range:
         p = pdf.pages[pi]
-        words = p.extract_words()
+        words = p.extract_words(x_tolerance=1.5)
         t0 = page_table_top(p)
-        normal = [w for w in words if 50 <= w['x0'] < 255 and w['top'] >= t0 and len(w['text']) >= 2]
-        axis_zone = [w for w in words if 40 <= w['x0'] < 50 and w['top'] >= t0]
-        items = []
-        for w in normal:
-            items.append({'top': w['top'], 'text': w['text']})
-        for w in axis_zone:
-            t = w['text']
-            if len(t) <= 2:
-                continue
-            if is_axis_residue(t):
-                continue
-            items.append({'top': w['top'], 'text': clean_axis_contamination(t)})
-        items.sort(key=lambda x: x['top'])
-        for it in items:
-            subjects.append({'page': pi, 'top': round(it['top'], 1), 'text': it['text']})
-    return subjects
+        amt = [w for w in words if w['x0'] >= 255]
+        subj = [w for w in words if 60 <= w['x0'] < 255 and len(w['text']) >= 2 and w['top'] > max(110, t0)]
+        subj.sort(key=lambda w: w['top'])
+        for w in subj:
+            cols = {}
+            for lb, lo, hi in AMOUNT_COLUMNS:
+                best, bd = None, 2.1
+                for a in amt:
+                    if lo <= a['x0'] < hi:
+                        d = abs(a['top'] - w['top'])
+                        if d <= 2.0 and d < bd:
+                            best, bd = a['text'], d
+                cols[lb] = best
+            rows.append({'page': pi, 'top': round(w['top'], 1), 'x0': round(w['x0'], 1),
+                         'name': normalize_name(w['text']), 'amounts': cols})
+    return rows
 
 
-def extract_amounts_for_page(p):
-    """ページ内の各top行について、4列の金額(備考含む)を集める。
-    戻り値: {round(top,1): {'予算A':str, '決算B':str, '差異AB':str, '備考':str}}"""
-    words = p.extract_words()
-    amount_words = [w for w in words if w['x0'] >= 255]
-    by_top = {}
-    for w in amount_words:
-        t = round(w['top'], 1)
-        by_top.setdefault(t, []).append(w)
-    result = {}
-    for t, ws in by_top.items():
-        row = {}
-        for name, xlo, xhi in AMOUNT_COLUMNS:
-            for w in ws:
-                if xlo <= w['x0'] < xhi:
-                    row[name] = w['text']
-                    break
-        result[t] = row
-    return result
+def assign_indent_stage(rows):
+    """ゾーンC内のx0を昇順の段(0,1,2..)へ量子化(近接<=2ptは同段)。"""
+    xs = sorted(set(r['x0'] for r in rows))
+    stages = []
+    for x in xs:
+        if stages and x - stages[-1][-1] <= 2:
+            stages[-1].append(x)
+        else:
+            stages.append([x])
+    x2s = {x: si for si, grp in enumerate(stages) for x in grp}
+    for r in rows:
+        r['stage'] = x2s[r['x0']]
 
 
-def find_amount_row(amounts_by_top, target_top, tol=2.0):
-    """target_topに最も近いtopの金額行を返す(誤差tol以内)。"""
-    best = None
-    best_diff = tol + 1
-    for t, row in amounts_by_top.items():
-        diff = abs(t - target_top)
-        if diff <= tol and diff < best_diff:
-            best = row
-            best_diff = diff
-    return best or {}
+# ---------------- 階層照合 ----------------
+def match_in_children(name, parent_idx):
+    """親の子範囲で 実名一致 → (何)子 → (None,None)。"""
+    kids = children_of(parent_idx)
+    for j in kids:
+        if leaf_name(CF[j]) == name:
+            return j, '実名'
+    for j in kids:
+        if is_nanika(leaf_name(CF[j])):
+            return j, '（何）'
+    return None, None
 
 
-def run_match_with_amounts(pdf_path, page_range, statement='CF'):
-    """指定ページ範囲で照合し、各行に金額4列を紐付ける。"""
-    pdf = pdfplumber.open(pdf_path)
-    subjects = extract_pdf_subjects_multi(pdf_path, page_range)
-    results = run_match_subjects(subjects, statement=statement)
+def match_facility(rows):
+    """1拠点分のゾーンC科目を階層照合。各rowに status/code/master_name/kind を付与。"""
+    assign_indent_stage(rows)
+    res = []
+    cur = {0: None, 1: None, 2: None, 3: None}  # stage -> 直近HITのCF index
+    for r in rows:
+        name, st = r['name'], r['stage']
+        found, kind = None, None
 
-    amounts_cache = {}
-    for r in results:
-        pi = r['page']
-        if pi not in amounts_cache:
-            amounts_cache[pi] = extract_amounts_for_page(pdf.pages[pi])
-        row = find_amount_row(amounts_cache[pi], r['top'])
-        r['予算A'] = row.get('予算A')
-        r['決算B'] = row.get('決算B')
-        r['差異AB'] = row.get('差異AB')
-        r['備考'] = row.get('備考')
-    return results
+        if st == 0:
+            if name in L2_NAME:
+                found, kind = L2_NAME[name][0], 'L2'
+            elif name in L3_NAME:
+                found, kind = L3_NAME[name][0], 'L3'
+            else:
+                nj = nanika_l3_for(name)
+                if nj is not None:
+                    found, kind = nj, 'L3（何）'
+            cur[0], cur[1], cur[2] = found, None, None
+        elif st >= 1 and cur[st - 1] is not None:
+            found, kind = match_in_children(name, cur[st - 1])
+            cur[st] = found
+
+        if found is not None:
+            res.append({**r, 'status': 'HIT', 'code': CF[found]['code'],
+                        'kind': kind, 'master_name': leaf_name(CF[found])})
+        else:
+            res.append({**r, 'status': '法人特有', 'code': None, 'kind': None, 'master_name': None})
+    return res
 
 
-def get_corp_name(pdf):
-    """法人名(1ページ目 top<30 の最初の語)を取得。"""
-    words = pdf.pages[0].extract_words()
-    top = [w for w in words if w['top'] < 30]
-    top.sort(key=lambda w: (w['top'], w['x0']))
-    return top[0]['text'] if top else ''
+# ---------------- 拠点分割・法人名 ----------------
+def detect_facility_boundaries(pdf):
+    bounds = []
+    for pi, p in enumerate(pdf.pages):
+        for w in p.extract_words(x_tolerance=1.5):
+            if '拠点区分' in w['text'] and w['top'] < 90:
+                bounds.append((pi, w['text']))
+                break
+    return bounds
 
 
 def build_facility_ranges(pdf):
-    """拠点境界から (拠点名, page_range) のリストを作る。"""
-    boundaries = detect_facility_boundaries(pdf)
+    b = detect_facility_boundaries(pdf)
     n = len(pdf.pages)
     ranges = []
-    for i, (pi, name) in enumerate(boundaries):
-        end = boundaries[i + 1][0] if i + 1 < len(boundaries) else n
+    for i, (pi, name) in enumerate(b):
+        end = b[i + 1][0] if i + 1 < len(b) else n
         ranges.append((name, range(pi, end)))
-    if not ranges:  # 拠点境界が検出できない場合は全体を1拠点扱い
+    if not ranges:
         ranges.append(('(単一拠点)', range(0, n)))
     return ranges
 
 
+def get_corp_name(pdf):
+    words = pdf.pages[0].extract_words(x_tolerance=1.5)
+    top = sorted([w for w in words if w['top'] < 30], key=lambda w: (w['top'], w['x0']))
+    return top[0]['text'] if top else ''
+
+
+# ---------------- メイン ----------------
 def process_pdf(pdf_path, statement='CF'):
-    """PDF全体を拠点ごとに照合し、金額付きの行リストを返す。"""
+    """PDF全体を拠点ごとに階層照合し、金額付き行リストを返す。"""
     pdf = pdfplumber.open(pdf_path)
     corp = get_corp_name(pdf)
-    fac_ranges = build_facility_ranges(pdf)
     all_rows = []
-    for fac_name, page_range in fac_ranges:
-        res = run_match_with_amounts(pdf_path, page_range, statement=statement)
+    for fac_name, page_range in build_facility_ranges(pdf):
+        rows = extract_zoneC(pdf, page_range)
+        res = match_facility(rows)
         for r in res:
+            amt = r.get('amounts', {})
             r['法人名'] = corp
             r['拠点区分'] = fac_name
             r['計算書'] = statement
+            r['予算A'] = amt.get('予算A')
+            r['決算B'] = amt.get('決算B')
+            r['差異AB'] = amt.get('差異AB')
+            r['備考'] = amt.get('備考')
             all_rows.append(r)
     return all_rows
 
 
-if __name__ == '__main__':
-    from collections import Counter
+def verify_totals(rows, statement='CF'):
+    """合算定義による集計検算(拠点横断・決算B)。空欄子は0。全子Noneの集計行はSKIP。"""
+    master = {r['code']: r for r in CF}
+    amt = {}
+    for r in rows:
+        if r['status'] == 'HIT' and r['code'] and r['決算B'] is not None:
+            if r['code'] not in amt:
+                amt[r['code']] = parse_amount(r['決算B'])
+    ok = ng = skip = 0
+    ng_list = []
+    for code, mr in master.items():
+        if mr['is_total'] != '1' or not mr['合算定義']:
+            continue
+        if code not in amt:
+            skip += 1
+            continue
+        ch = json.loads(mr['合算定義'])
+        if all(amt.get(c['code']) is None for c in ch):
+            skip += 1
+            continue
+        tot = sum((amt.get(c['code']) or 0) * (1 if c['sign'] == '+' else -1) for c in ch)
+        if tot == amt[code]:
+            ok += 1
+        else:
+            ng += 1
+            ng_list.append((code, amt[code], tot))
+    return ok, ng, skip, ng_list
 
-    targets = [('tsuneishi_1-4.pdf', 'CF'), ('youshiki_1-4.pdf', 'CF')]
-    all_rows = []
-    for path, stmt in targets:
-        rows = process_pdf(path, statement=stmt)
-        all_rows.extend(rows)
-        for fac in sorted(set(r['拠点区分'] for r in rows)):
-            sub = [r for r in rows if r['拠点区分'] == fac]
-            c = Counter(r['status'] for r in sub)
-            ok, ng, skip, ng_list = verify_totals(sub, statement=stmt)
-            print(f"{sub[0]['法人名']} / {fac}")
-            print(f"  照合: {dict(c)} (計{len(sub)})")
-            print(f"  集計検算: OK={ok} NG={ng} SKIP={skip}")
-            for code, exp, calc in ng_list:
-                print(f"    NG {code} 期待={exp:,} 計算={calc:,} 差={exp - calc:,}")
-    write_csv(all_rows, '照合結果_1-4_CF.csv')
-    print(f"\n総行数 {len(all_rows)} を 照合結果_1-4_CF.csv に出力")
+
+def write_csv(rows, out_path):
+    cols = ['法人名', '拠点区分', '計算書', 'page', 'top', 'status', 'kind', 'code', 'name',
+            'master_name', '予算A', '決算B', '差異AB', '備考']
+    with open(out_path, 'w', encoding='utf-8-sig', newline='') as f:
+        w = csv.DictWriter(f, fieldnames=cols, extrasaction='ignore')
+        w.writeheader()
+        for r in rows:
+            w.writerow({**r, 'pdf': r.get('name')})
+
+
+if __name__ == '__main__':
+    import glob
+    from collections import Counter
+    for path in sorted(glob.glob('*_1-4.pdf')):
+        rows = process_pdf(path)
+        corp = rows[0]['法人名'] if rows else path
+        c = Counter(r['status'] for r in rows)
+        ok, ng, skip, _ = verify_totals(rows)
+        print(f"{corp} ({path}): {dict(c)} 計{len(rows)} / 集計検算 OK={ok} NG={ng} SKIP={skip}")
