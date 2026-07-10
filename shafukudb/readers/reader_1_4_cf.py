@@ -31,6 +31,20 @@
 - 縦書き軸帯(L1=活動・部/L2=収入・支出)は読まない。ゾーンC(x0>=60)の横書き科目のみ。
 - ヘッダー除外・拠点境界検出はページ構造(罫線・見出し語)で判定。
 - 半角括弧はマスタ表記(全角)へ正規化。
+
+■ フェーズ2-6: 集計NG原因特定で見つかった2件の改修(2025年度3社データで確認)
+(1) 継続ページの先頭行が見出しと誤認されて抽出漏れになる問題(page_table_top)
+    L3集計科目の子リストがページをまたぐとき、継続ページには表ヘッダーが
+    再描画されず水平線が検出できない。従来はその場合でも一律110ptの下駄を
+    履かせて「top<=110は見出し」として除外していたが、継続ページでは
+    データ行がページ最上部(縦罫線がtop<60から開始)に来るため、正当な
+    科目行(例: 車輌費支出)が丸ごと抽出から漏れていた。縦罫線の開始位置で
+    継続ページを判定し、その場合は下駄を外すことで解消。
+(2) 同一(何)placeholderコードに複数の実額が乗るとき、検算が最初の1件しか
+    合算しない問題(_verify_one_facility)。マスタの粒度を超える法人特有的な
+    科目(例: 固定資産取得支出の子である「構築物取得支出」、（何）事業収入配下の
+    複数の独立した事業収入ブロック)は同じコードに複数帰属するのが正常であり、
+    合算が正しい。従来の「最初の非null値のみ採用」を単純合算に変更して解消。
 """
 import csv
 import json
@@ -137,11 +151,25 @@ def nanika_l3_for(name):
 
 # ---------------- 抽出(ゾーンC) ----------------
 def page_table_top(p):
+    """そのページで科目抽出を開始すべきtop位置を返す。
+    - 通常ページ: 表ヘッダー帯の下端(x0≈39.7の水平線ペア)の下側。
+    - 継続ページ(フェーズ2-6で追加): 表ヘッダーが再描画されず水平線が検出できないが、
+      縦罫線がページ最上部近く(top<60)から始まっている場合、それは見出し無しで
+      前ページの子リストがそのまま続いていることを示す。この場合は110ptの
+      固定下駄を履かせず、そのままt0=0(実質フィルタ無し)を返す。
+      これにより、事業費支出や固定資産取得支出等の子科目リストがページ境界を
+      またいだ際、continuation側先頭の行(top<110)が見出しと誤認されて
+      抽出漏れになる問題を防ぐ。
+    - どちらの判定もできない場合は、安全側としてフォールバックの110を返す。
+    """
     h_outer = [r['top'] for r in p.rects if r['height'] < 1.0 and abs(r['x0'] - 39.7) < 0.5]
     h_outer = sorted(set(round(t, 1) for t in h_outer))
     if len(h_outer) >= 2 and h_outer[1] - h_outer[0] < 20:
         return h_outer[1]
-    return 0
+    v_rules = [r['top'] for r in p.rects if r['width'] < 3 and r['height'] > 50]
+    if v_rules and min(v_rules) < 60:
+        return 0
+    return 110
 
 
 def extract_zoneC(pdf, page_range):
@@ -152,7 +180,7 @@ def extract_zoneC(pdf, page_range):
         words = p.extract_words(x_tolerance=1.5)
         t0 = page_table_top(p)
         amt = [w for w in words if w['x0'] >= 255]
-        subj = [w for w in words if 60 <= w['x0'] < 255 and len(w['text']) >= 2 and w['top'] > max(110, t0)]
+        subj = [w for w in words if 60 <= w['x0'] < 255 and len(w['text']) >= 2 and w['top'] > t0]
         subj.sort(key=lambda w: w['top'])
         for w in subj:
             cols = {}
@@ -278,14 +306,21 @@ def process_pdf(pdf_path, statement='CF'):
     return all_rows
 
 
-def verify_totals(rows, statement='CF'):
-    """合算定義による集計検算(拠点横断・決算B)。空欄子は0。全子Noneの集計行はSKIP。"""
-    master = {r['code']: r for r in CF}
+def _verify_one_facility(fac_rows, master):
+    """1拠点分の行に対する集計検算。空欄子は0。全子未出現の集計行はSKIP。
+
+    同一codeが複数行に出現する場合は合算する(フェーズ2-6で変更)。
+    マスタに個別コードを持たない法人特有的な科目が、複数とも同じ(何)placeholder
+    (例: CF-03-03-002-005-000（何）取得支出、CF-01-01-017-000-000（何）事業収入)
+    に帰属するケースがあり、以前は「最初に見つかった非null値のみ採用・以降は無視」
+    としていたため、2件目以降の金額が集計から漏れて検算NGになっていた。
+    同一placeholderに複数の実額が乗るのは構造的に正常(マスタの粒度がそこまで
+    細かくないだけ)なので、単純合算が正しい。
+    戻り値: (ok, ng, skip, ng_list)。ng_listは (code, 期待値, 計算値)。"""
     amt = {}
-    for r in rows:
+    for r in fac_rows:
         if r['status'] == 'HIT' and r['code'] and r['決算B'] is not None:
-            if r['code'] not in amt:
-                amt[r['code']] = parse_amount(r['決算B'])
+            amt[r['code']] = amt.get(r['code'], 0) + parse_amount(r['決算B'])
     ok = ng = skip = 0
     ng_list = []
     for code, mr in master.items():
@@ -295,7 +330,7 @@ def verify_totals(rows, statement='CF'):
             skip += 1
             continue
         ch = json.loads(mr['合算定義'])
-        if all(amt.get(c['code']) is None for c in ch):
+        if all(c['code'] not in amt for c in ch):
             skip += 1
             continue
         tot = sum((amt.get(c['code']) or 0) * (1 if c['sign'] == '+' else -1) for c in ch)
@@ -304,6 +339,29 @@ def verify_totals(rows, statement='CF'):
         else:
             ng += 1
             ng_list.append((code, amt[code], tot))
+    return ok, ng, skip, ng_list
+
+
+def verify_totals(rows, statement='CF'):
+    """合算定義による集計検算。拠点ごとに検算してOK/NG/SKIPを積算する。
+
+    同一codeが複数拠点に出現するため、拠点をまたいで一括検算すると2拠点目以降の値が
+    握り潰されて検算が壊れる。必ず拠点(拠点区分)ごとに区切って検算すること。
+    戻り値: (ok, ng, skip, ng_list)。ng_listは (拠点区分, code, 期待値, 計算値)。
+    """
+    master = {r['code']: r for r in CF}
+    by_fac = defaultdict(list)
+    for r in rows:
+        by_fac[r.get('拠点区分', '(単一拠点)')].append(r)
+    ok = ng = skip = 0
+    ng_list = []
+    for fac_name, fac_rows in by_fac.items():
+        o, n, s, nl = _verify_one_facility(fac_rows, master)
+        ok += o
+        ng += n
+        skip += s
+        for code, exp, calc in nl:
+            ng_list.append((fac_name, code, exp, calc))
     return ok, ng, skip, ng_list
 
 
