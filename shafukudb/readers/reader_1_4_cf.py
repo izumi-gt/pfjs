@@ -45,6 +45,20 @@
     科目(例: 固定資産取得支出の子である「構築物取得支出」、（何）事業収入配下の
     複数の独立した事業収入ブロック)は同じコードに複数帰属するのが正常であり、
     合算が正しい。従来の「最初の非null値のみ採用」を単純合算に変更して解消。
+
+■ フェーズ2-7: 法人特有金額のプールによる帳尻合わせ(2025年度3社データで確認)
+   マスタに無い法人特有科目(実名にもnanika接尾辞にも当たらず親も特定できず法人特有へ
+   落ちる科目。例: 「居宅介護料収入（利用者負担金収入）」のような連結見出し、
+   「高次脳機能障害支援体制整備事業」のようなstage0の事業名)は金額が集計から行落ちして
+   親の検算がNGになっていた。これを「法人特有のまま(=NG一覧に残したまま)」金額だけ
+   親の集計にプールして帳尻を合わせる。
+   - match_facility: 法人特有行に pseudo_code(監査用疑似コード)、pool_parent(金額を
+     プールする先の実code。stage>=1は直近成功親、stage0は直近HITのL1/L2から収入計/
+     支出計を継承)、pool_depth(二重計上防止用の相対深さ)を付与。
+   - _verify_one_facility: pool_parent 配下の法人特有金額を、同一parent配下では最深段
+     だけ採用(見出し=明細合計の2段組で見出しと明細を両方足す二重計上を防止)して
+     親ノードの計算値に加算。浅い段と最深段の合計が食い違う場合は警告を出す
+     (verify_totals_with_warnings で取得)。
 """
 import csv
 import json
@@ -224,11 +238,33 @@ def match_in_children(name, parent_idx):
     return None, None
 
 
+def _l1l2_of_code(code):
+    """codeから (L1, L2) を返す。例: 'CF-01-03-001-000-000' -> ('01', '03')。"""
+    if not code:
+        return None, None
+    parts = code.split('-')
+    return parts[1], parts[2]
+
+
 def match_facility(rows):
-    """1拠点分のゾーンC科目を階層照合。各rowに status/code/master_name/kind を付与。"""
+    """1拠点分のゾーンC科目を階層照合。各rowに status/code/master_name/kind を付与。
+
+    (フェーズ2-7) 照合失敗行(法人特有)の金額プール:
+    マスタに無い法人特有科目は status='法人特有' のままだが、金額の行落ちで集計検算が
+    合わなくなるのを防ぐため、次を付与する。
+    - pseudo_code: 監査用。「直近成功した親の実code + '/' + 未照合科目名」。'/'区切りで
+      実codeと衝突しない。親が全く無い(stage0で直近HITも無い)場合は 'CF-<name>'。
+    - pool_parent: この金額をプールすべき先の実code。stage>=1で親が特定できていれば
+      その親のcode。stage0で親不明のときは直近HITのL1/L2から収入計/支出計のL2集計code。
+      いずれも無ければNone(検算に寄与しない純粋な法人特有)。
+    - pool_depth: 同一プール親配下での相対的な深さ(親からの段差)。二重計上防止に使う。
+      verify_totals は「同一pool_parent配下では最も深い段の行だけ」をプールに採用する
+      (見出し=明細合計の2段組で見出しと明細を両方足す二重計上を防ぐ)。
+    """
     assign_indent_stage(rows)
     res = []
     cur = {0: None, 1: None, 2: None, 3: None}  # stage -> 直近HITのCF index
+    last_hit_l1l2 = (None, None)  # stage0失敗時の収入/支出継承用
     for r in rows:
         name, st = r['name'], r['stage']
         found, kind = None, None
@@ -248,10 +284,36 @@ def match_facility(rows):
             cur[st] = found
 
         if found is not None:
-            res.append({**r, 'status': 'HIT', 'code': CF[found]['code'],
-                        'kind': kind, 'master_name': leaf_name(CF[found])})
+            code = CF[found]['code']
+            last_hit_l1l2 = _l1l2_of_code(code)
+            res.append({**r, 'status': 'HIT', 'code': code,
+                        'kind': kind, 'master_name': leaf_name(CF[found]),
+                        'pseudo_code': None, 'pool_parent': None, 'pool_depth': None})
         else:
-            res.append({**r, 'status': '法人特有', 'code': None, 'kind': None, 'master_name': None})
+            # 直近成功した親(自分より浅い段でHITしているcur)を探す
+            anc_idx, anc_stage = None, None
+            for s in range(st - 1, -1, -1):
+                if cur.get(s) is not None:
+                    anc_idx, anc_stage = cur[s], s
+                    break
+            if anc_idx is not None:
+                anc_code = CF[anc_idx]['code']
+                pseudo = f'{anc_code}/{name}'
+                pool_parent = anc_code
+                pool_depth = st - anc_stage
+            else:
+                # stage0で親なし: プール先を持たない純粋な法人特有とする。
+                # (フェーズ2-7当初は直近HITのL1/L2から収入計/支出計へプールする案だったが、
+                #  様式1-4では収入計/支出計の集計対象ノード CF-01-01-000... 等は金額列を
+                #  持たず出現しないため、そこへプールすると「期待値0 vs 計算値=プール額」の
+                #  偽NGを生む。実データ上stage0の親なし科目は金額0/Noneで実益も無いため、
+                #  プールせず純粋な法人特有に留める。将来実額が出たら別途対応する。)
+                pseudo = f'CF-{name}'
+                pool_parent = None
+                pool_depth = None
+            res.append({**r, 'status': '法人特有', 'code': None, 'kind': None,
+                        'master_name': None, 'pseudo_code': pseudo,
+                        'pool_parent': pool_parent, 'pool_depth': pool_depth})
     return res
 
 
@@ -306,6 +368,40 @@ def process_pdf(pdf_path, statement='CF'):
     return all_rows
 
 
+def _pool_amounts_by_parent(fac_rows):
+    """法人特有行のプール金額を pool_parent ごとに集計する(フェーズ2-7)。
+
+    二重計上防止: 同一 pool_parent 配下に複数段(見出し+明細)がある場合、
+    最も深い pool_depth の行だけを採用する。見出し=明細合計の2段組で
+    見出しと明細を両方足す誤りを防ぐ。
+
+    金額矛盾チェック: 同一 pool_parent 配下で「浅い段の合計」と「最深段の合計」が
+    どちらも非ゼロなのに一致しない場合、単純な見出し=明細ではない可能性があるため
+    警告に載せる(検算は最深段採用で続行)。
+
+    戻り値: (pool_by_parent: {parent_code: 採用金額}, warnings: [str])。
+    """
+    from collections import defaultdict as _dd
+    by_parent_depth = _dd(lambda: _dd(int))  # parent -> depth -> 金額合計
+    for r in fac_rows:
+        if r['status'] == '法人特有' and r.get('pool_parent') and r.get('決算B') is not None:
+            d = r.get('pool_depth') or 1
+            by_parent_depth[r['pool_parent']][d] += parse_amount(r['決算B'])
+
+    pool_by_parent = {}
+    warnings = []
+    for parent, depth_map in by_parent_depth.items():
+        depths = sorted(depth_map)
+        deepest = depths[-1]
+        pool_by_parent[parent] = depth_map[deepest]
+        for d in depths[:-1]:
+            if depth_map[d] != 0 and depth_map[d] != depth_map[deepest]:
+                warnings.append(
+                    f'{parent}: プール金額の段間不一致 '
+                    f'(depth{d}={depth_map[d]:,} vs depth{deepest}={depth_map[deepest]:,})')
+    return pool_by_parent, warnings
+
+
 def _verify_one_facility(fac_rows, master):
     """1拠点分の行に対する集計検算。空欄子は0。全子未出現の集計行はSKIP。
 
@@ -316,30 +412,39 @@ def _verify_one_facility(fac_rows, master):
     としていたため、2件目以降の金額が集計から漏れて検算NGになっていた。
     同一placeholderに複数の実額が乗るのは構造的に正常(マスタの粒度がそこまで
     細かくないだけ)なので、単純合算が正しい。
-    戻り値: (ok, ng, skip, ng_list)。ng_listは (code, 期待値, 計算値)。"""
+
+    (フェーズ2-7) 法人特有行の金額を pool_parent 経由でプールし、その親ノードの
+    計算値に加算する。マスタに無い科目の行落ちで親集計が合わないNGを、法人特有の
+    まま(=一覧に残したまま)帳尻だけ合わせる。
+    戻り値: (ok, ng, skip, ng_list, pool_warnings)。ng_listは (code, 期待値, 計算値)。"""
     amt = {}
     for r in fac_rows:
         if r['status'] == 'HIT' and r['code'] and r['決算B'] is not None:
             amt[r['code']] = amt.get(r['code'], 0) + parse_amount(r['決算B'])
+
+    pool_by_parent, pool_warnings = _pool_amounts_by_parent(fac_rows)
+
     ok = ng = skip = 0
     ng_list = []
     for code, mr in master.items():
         if mr['is_total'] != '1' or not mr['合算定義']:
             continue
-        if code not in amt:
+        if code not in amt and code not in pool_by_parent:
             skip += 1
             continue
         ch = json.loads(mr['合算定義'])
-        if all(c['code'] not in amt for c in ch):
+        if all(c['code'] not in amt for c in ch) and code not in pool_by_parent:
             skip += 1
             continue
         tot = sum((amt.get(c['code']) or 0) * (1 if c['sign'] == '+' else -1) for c in ch)
-        if tot == amt[code]:
+        tot += pool_by_parent.get(code, 0)  # このノード自身にプールされた法人特有金額
+        expected = amt.get(code, 0)
+        if tot == expected:
             ok += 1
         else:
             ng += 1
-            ng_list.append((code, amt[code], tot))
-    return ok, ng, skip, ng_list
+            ng_list.append((code, expected, tot))
+    return ok, ng, skip, ng_list, pool_warnings
 
 
 def verify_totals(rows, statement='CF'):
@@ -347,27 +452,44 @@ def verify_totals(rows, statement='CF'):
 
     同一codeが複数拠点に出現するため、拠点をまたいで一括検算すると2拠点目以降の値が
     握り潰されて検算が壊れる。必ず拠点(拠点区分)ごとに区切って検算すること。
+    (フェーズ2-7) 法人特有金額のプール警告も拠点名付きで集約して返す。
     戻り値: (ok, ng, skip, ng_list)。ng_listは (拠点区分, code, 期待値, 計算値)。
+    プール警告は verify_totals_with_warnings で取得可能。
     """
+    ok, ng, skip, ng_list, _ = _verify_totals_impl(rows)
+    return ok, ng, skip, ng_list
+
+
+def verify_totals_with_warnings(rows, statement='CF'):
+    """verify_totals と同じだが、プール金額の段間不一致警告も返す(フェーズ2-7)。
+    戻り値: (ok, ng, skip, ng_list, warnings)。warningsは (拠点区分, メッセージ)。"""
+    return _verify_totals_impl(rows)
+
+
+def _verify_totals_impl(rows):
     master = {r['code']: r for r in CF}
     by_fac = defaultdict(list)
     for r in rows:
         by_fac[r.get('拠点区分', '(単一拠点)')].append(r)
     ok = ng = skip = 0
     ng_list = []
+    warnings = []
     for fac_name, fac_rows in by_fac.items():
-        o, n, s, nl = _verify_one_facility(fac_rows, master)
+        o, n, s, nl, wl = _verify_one_facility(fac_rows, master)
         ok += o
         ng += n
         skip += s
         for code, exp, calc in nl:
             ng_list.append((fac_name, code, exp, calc))
-    return ok, ng, skip, ng_list
+        for w in wl:
+            warnings.append((fac_name, w))
+    return ok, ng, skip, ng_list, warnings
 
 
 def write_csv(rows, out_path):
     cols = ['法人名', '拠点区分', '計算書', 'page', 'top', 'status', 'kind', 'code', 'name',
-            'master_name', '予算A', '決算B', '差異AB', '備考']
+            'master_name', 'pseudo_code', 'pool_parent', 'pool_depth',
+            '予算A', '決算B', '差異AB', '備考']
     with open(out_path, 'w', encoding='utf-8-sig', newline='') as f:
         w = csv.DictWriter(f, fieldnames=cols, extrasaction='ignore')
         w.writeheader()
@@ -382,5 +504,7 @@ if __name__ == '__main__':
         rows = process_pdf(path)
         corp = rows[0]['法人名'] if rows else path
         c = Counter(r['status'] for r in rows)
-        ok, ng, skip, _ = verify_totals(rows)
+        ok, ng, skip, _, warns = verify_totals_with_warnings(rows)
         print(f"{corp} ({path}): {dict(c)} 計{len(rows)} / 集計検算 OK={ok} NG={ng} SKIP={skip}")
+        for fac, w in warns:
+            print(f"    ⚠ プール警告[{fac}]: {w}")

@@ -15,14 +15,17 @@ from collections import Counter
 import pdfplumber
 import reader_1_4_cf as r
 
-# ---- 基準値（フェーズ2-6改修版reader・拠点ごと検算） ----
+# ---- 基準値（フェーズ2-7改修版reader + seiten_master_v4・拠点ごと検算） ----
 # 更新履歴:
 #   フェーズ2-5確定版: hanano OK45/NG4, hiroshima OK370/NG71, atokai OK154/NG32
-#   フェーズ2-6改修後(継続ページ判定+同一コード合算): 下記に更新。NG総数107→25。
+#   フェーズ2-6(継続ページ判定+同一コード合算): NG総数107→25。
+#   フェーズ2-7(seiten_master_v4拡充 + 法人特有金額プール): NG総数25→1。
+#     残る1件は広島・高次脳機能センターのstage0親なし事業(実額あり)で、意図的に
+#     プール対象外(将来対応)としているため。
 BASELINE_COUNTS = {
-    'hanano_1-4.pdf':    {'HIT': 608,  '法人特有': 22,  'OK': 51,  'NG': 1,  'SKIP': 172},
-    'hiroshima_1-4.pdf': {'HIT': 6696, '法人特有': 414, 'OK': 437, 'NG': 13, 'SKIP': 1566},
-    'atokai_1-4.pdf':    {'HIT': 1350, '法人特有': 270, 'OK': 197, 'NG': 11, 'SKIP': 912},
+    'hanano_1-4.pdf':    {'HIT': 614,  '法人特有': 16,  'OK': 54,  'NG': 0, 'SKIP': 172},
+    'hiroshima_1-4.pdf': {'HIT': 6840, '法人特有': 270, 'OK': 462, 'NG': 1, 'SKIP': 1571},
+    'atokai_1-4.pdf':    {'HIT': 1370, '法人特有': 250, 'OK': 208, 'NG': 0, 'SKIP': 922},
 }
 
 # 既知の帰属正解: (PDF, 拠点index, 科目名, インデント段, 期待code or None, 期待status)
@@ -30,7 +33,9 @@ BASELINE_COUNTS = {
 KNOWN_ATTRIBUTIONS = [
     ('hiroshima_1-4.pdf', 0, '県立施設運営事業収入',            0, 'CF-01-01-017-000-000', 'HIT'),
     ('hiroshima_1-4.pdf', 0, '受託事業収入',                    1, 'CF-01-01-017-001-000', 'HIT'),
-    ('hiroshima_1-4.pdf', 0, 'スポーツ交流センター運営事業収入', 2, None,                   '法人特有'),
+    # スポーツ交流センター運営事業収入: v3では法人特有だったが、seiten_master_v4で
+    # （何）事業収入配下の頻出追加科目 017-001-098 が追加されたため実名HITに変わった(改善)。
+    ('hiroshima_1-4.pdf', 0, 'スポーツ交流センター運営事業収入', 2, 'CF-01-01-017-001-098', 'HIT'),
     ('hiroshima_1-4.pdf', 0, 'その他の事業収入',                1, 'CF-01-01-017-002-000', 'HIT'),
     ('hiroshima_1-4.pdf', 0, '補助金事業収入（公費）',          2, 'CF-01-01-009-007-001', 'HIT'),
     ('hiroshima_1-4.pdf', 0, '県納付金支出',                    0, 'CF-01-03-006-000-000', 'HIT'),
