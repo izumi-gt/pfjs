@@ -59,6 +59,14 @@
      だけ採用(見出し=明細合計の2段組で見出しと明細を両方足す二重計上を防止)して
      親ノードの計算値に加算。浅い段と最深段の合計が食い違う場合は警告を出す
      (verify_totals_with_warnings で取得)。
+
+■ フェーズ2-8: stage0見出しの子先読みによる(何)帰属(2025年度・広島で確認)
+   「高次脳機能障害支援体制整備事業」のように、stage0の見出し自身の名前が「〜事業」で
+   終わり収入/支出を判別できない科目は、従来 nanika_l3_for に当たらず法人特有へ落ちて
+   親(事業活動収入計)の検算NGになっていた。直後に続く子(stage>=1)の名前末尾を先読みし、
+   「〜収入/収益」なら（何）事業収入、「〜支出」なら（何）支出へ帰属する
+   (nanika_l3_by_child_suffix)。見出し名だけで収入側へ倒すと同名パターンの支出系を
+   誤帰属する危険があるため、必ず子の末尾で収入/支出を判定する。
 """
 import csv
 import json
@@ -160,6 +168,27 @@ def nanika_l3_for(name):
         return NANIKA_L3.get(name[-4:])
     if name[-2:] in ('収入', '支出', '収益'):
         return NANIKA_L3.get(name[-2:])
+    return None
+
+
+def nanika_l3_by_child_suffix(child_names):
+    """(フェーズ2-8) stage0の見出し自身が収入/支出を判別できない名前
+    (例:「高次脳機能障害支援体制整備事業」のように末尾が「事業」で止まる)のとき、
+    直後の子科目名の末尾から収入/支出を判定して(何)L3へ帰属する。
+
+    社会福祉法人会計基準のCF(資金収支計算書)では末端勘定は必ず「〜収入/収益」または
+    「〜支出」で終わるため、子の末尾を見れば収入側/支出側が確実に分かる。見出し名だけで
+    機械的に収入側へ倒すと、同じ「〜事業」命名の支出系プログラムを誤帰属する危険がある
+    (izumi氏指摘)ので、必ず子の末尾で判定する。
+    child_names: 見出し直後に続く子科目名のリスト(浅い順)。
+    戻り値: (何)L3のindex or None。"""
+    for cn in child_names:
+        if cn[-4:] in ('事業収入', '事業収益'):
+            return NANIKA_L3.get(cn[-4:])
+        if cn[-2:] in ('収入', '収益'):
+            return NANIKA_L3.get('事業収入')  # 収入側 → （何）事業収入
+        if cn[-2:] == '支出':
+            return NANIKA_L3.get('支出')       # 支出側 → （何）支出
     return None
 
 
@@ -265,7 +294,7 @@ def match_facility(rows):
     res = []
     cur = {0: None, 1: None, 2: None, 3: None}  # stage -> 直近HITのCF index
     last_hit_l1l2 = (None, None)  # stage0失敗時の収入/支出継承用
-    for r in rows:
+    for i, r in enumerate(rows):
         name, st = r['name'], r['stage']
         found, kind = None, None
 
@@ -278,6 +307,18 @@ def match_facility(rows):
                 nj = nanika_l3_for(name)
                 if nj is not None:
                     found, kind = nj, 'L3（何）'
+                else:
+                    # (フェーズ2-8) 見出し自身では収入/支出を判別できない
+                    # (例:「〜事業」で終わる)。直後に続く子(stage>=1が連続する範囲)の
+                    # 名前末尾を先読みして収入側/支出側の(何)L3へ帰属する。
+                    child_names = []
+                    for r2 in rows[i + 1:]:
+                        if r2['stage'] == 0:
+                            break
+                        child_names.append(r2['name'])
+                    nj2 = nanika_l3_by_child_suffix(child_names)
+                    if nj2 is not None:
+                        found, kind = nj2, 'L3（何）子先読み'
             cur[0], cur[1], cur[2] = found, None, None
         elif st >= 1 and cur[st - 1] is not None:
             found, kind = match_in_children(name, cur[st - 1])

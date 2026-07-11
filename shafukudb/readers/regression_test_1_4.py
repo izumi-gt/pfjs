@@ -15,17 +15,18 @@ from collections import Counter
 import pdfplumber
 import reader_1_4_cf as r
 
-# ---- 基準値（フェーズ2-7改修版reader + seiten_master_v4・拠点ごと検算） ----
+# ---- 基準値（フェーズ2-8改修版reader + seiten_master_v4・拠点ごと検算） ----
 # 更新履歴:
 #   フェーズ2-5確定版: hanano OK45/NG4, hiroshima OK370/NG71, atokai OK154/NG32
 #   フェーズ2-6(継続ページ判定+同一コード合算): NG総数107→25。
 #   フェーズ2-7(seiten_master_v4拡充 + 法人特有金額プール): NG総数25→1。
-#     残る1件は広島・高次脳機能センターのstage0親なし事業(実額あり)で、意図的に
-#     プール対象外(将来対応)としているため。
+#   フェーズ2-8(stage0見出しの子先読み(何)帰属): 広島の残り1件も解消しNG総数→0。
+#     エフアイジイ福祉会(4社目・保育事業含む)を検証対象に追加。全4社NG=0。
 BASELINE_COUNTS = {
     'hanano_1-4.pdf':    {'HIT': 614,  '法人特有': 16,  'OK': 54,  'NG': 0, 'SKIP': 172},
-    'hiroshima_1-4.pdf': {'HIT': 6840, '法人特有': 270, 'OK': 462, 'NG': 1, 'SKIP': 1571},
+    'hiroshima_1-4.pdf': {'HIT': 6894, '法人特有': 216, 'OK': 464, 'NG': 0, 'SKIP': 1570},
     'atokai_1-4.pdf':    {'HIT': 1370, '法人特有': 250, 'OK': 208, 'NG': 0, 'SKIP': 922},
+    'fig_1-4.pdf':       {'HIT': 1952, '法人特有': 8,   'OK': 157, 'NG': 0, 'SKIP': 747},
 }
 
 # 既知の帰属正解: (PDF, 拠点index, 科目名, インデント段, 期待code or None, 期待status)
