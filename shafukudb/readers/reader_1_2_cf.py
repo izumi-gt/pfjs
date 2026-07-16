@@ -40,7 +40,7 @@ AXIS_LABEL_MINLEN = 5            # 軸帯に割込む集計ラベルの最小長
 
 
 # ---------------- マスタ（照合層は流用可能な共通ヘルパ）----------------
-def load_master_cf(path='seiten_master_v3.csv'):
+def load_master_cf(path='seiten_master_v4.csv'):
     with open(path, encoding='utf-8-sig', newline='') as f:
         rows = list(csv.DictReader(f))
     return [r for r in rows if r['L0コード'] == 'CF']
@@ -119,16 +119,39 @@ def code_depth(code):
     return d
 
 
-def _candidate_indices(text, cf):
-    """textに一致するマスタ行index全て（原文leaf一致 or 表示レベル2の正規化一致）。"""
-    stext = strip_formula(text)
-    out = []
+def _build_nanika_l3(cf):
+    """cf から (何) L3 catch-all の {接尾辞: index} を作る。
+    対象は depth3(=L3)の記号的 catch-all 科目名のみ。CFには（何）事業収入/
+    （何）収入/（何）支出 が存在する（（何）事業収益/（何）収益 はCFには無い）。"""
+    m = {}
     for j, r in enumerate(cf):
-        if leaf_name(r) == text:
-            out.append(j)
-        elif r['表示レベル'] == '2' and strip_formula(leaf_name(r)) == stext:
-            out.append(j)
-    return out
+        if code_depth(r['code']) != 3:
+            continue
+        n = leaf_name(r)
+        if n == '（何）事業収入':
+            m['事業収入'] = j
+        elif n == '（何）事業収益':
+            m['事業収益'] = j
+        elif n == '（何）収入':
+            m['収入'] = j
+        elif n == '（何）支出':
+            m['支出'] = j
+        elif n == '（何）収益':
+            m['収益'] = j
+    return m
+
+
+def nanika_l3_for(name, nmap):
+    """L3実名に当たらない科目を、接尾辞で(何)L3へ帰属。
+    まず4文字接尾辞（事業収入/事業収益）→（何）事業収入 系を優先し、
+    次に2文字接尾辞（収入/支出/収益）→（何）収入/（何）支出 系で判定する。
+    （何）事業収入→（何）収入/（何）支出 の順に評価する（izumi氏指摘の照合順序）。
+    該当なしはNone（真の法人固有）。"""
+    if name[-4:] in ('事業収入', '事業収益'):
+        return nmap.get(name[-4:])
+    if name[-2:] in ('収入', '支出', '収益'):
+        return nmap.get(name[-2:])
+    return None
 
 
 def run_match(rows, cf):
@@ -137,9 +160,22 @@ def run_match(rows, cf):
               深度≤3の照合キーはマスタ全体で一意（'収入'/'支出'の軸帯見出しは
               科目として現れないため除外）。よって順序に依存せず安全で、
               WAM出現順の揺れ（例: 経常経費補助金収入が事業収入の後に出る）を吸収する。
-      Stage2: Stage1で未解決の科目（深度≥4。例: その他の事業収入）を位置で照合。
-              直前のStage1一致より後方の最小候補を採る。前方に無く候補が唯一なら救済。
+      Stage2: Stage1でも未解決の科目を、末尾接尾辞で(何)L3へ帰属（nanika_l3_for）。
+              様式1-1/1-2/1-3はL2/L3集計値のみを掲載しdepth4以上が出現しないため
+              （華野・広島・あと会・エフアイジイの4法人×3様式で実測確認。医療系・
+              保育系を含む法人でも同様）、未解決の残りは「よそのカテゴリの深い子科目」
+              ではなく法人独自の事業名であり、接尾辞での(何)帰属が安全に機能する。
+              末尾が収入/支出で終わらないもの（例:「〜事業」で止まる）のみ真の
+              法人固有として残す。
       それ以外は法人固有（code=None・元名保持・連番）。
+
+      [削除履歴] 旧Stage2（深度≥4の科目を位置で照合。直前一致より後方の最小候補を
+      採用）は、上記4法人×3様式(12ケース)の実測で貢献が広島の1件（「その他の
+      事業収入」がmaster内17ヶ所の同名候補のうち深度5の1枝へ機械的に位置一致）
+      のみと判明。かつその1件は1-4の階層照合が導く枝と異なる誤ったブランチ選択
+      であったため削除。この行は削除後、本Stage2(nanika)が深度3の「（何）事業収入」
+      に正しく帰属させる（1-4のstage0解決と一致）。全4法人×3様式で削除前後の
+      HIT/法人固有件数・列恒等式/数式連鎖/ブロック合算のNG件数に変化なしを確認済み。
     """
     depth = [code_depth(r['code']) for r in cf]
     # 深度≤3の照合キー -> index群（順不同・一意判定用）
@@ -157,21 +193,14 @@ def run_match(rows, cf):
         if len(cand) == 1:
             resolved[i] = cand[0]
 
-    # --- Stage2: 残りを位置で（深度≥4想定） ---
+    # --- Stage2: 未解決を末尾接尾辞で(何)L3へ帰属 ---
+    nmap = _build_nanika_l3(cf)
     for i, row in enumerate(rows):
         if resolved[i] is not None:
             continue
-        cands = _candidate_indices(row['name'], cf)
-        prev_idx = None
-        for k in range(i - 1, -1, -1):
-            if resolved[k] is not None:
-                prev_idx = resolved[k]
-                break
-        forward = [j for j in cands if prev_idx is None or j > prev_idx]
-        if forward:
-            resolved[i] = min(forward)
-        elif len(cands) == 1:
-            resolved[i] = cands[0]
+        j = nanika_l3_for(row['name'], nmap)
+        if j is not None:
+            resolved[i] = j
 
     # --- 整形 ---
     results = []
