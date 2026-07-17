@@ -75,9 +75,9 @@ from pathlib import Path
 
 import pdfplumber
 
-MASTER_PATH = Path(__file__).resolve().parent / 'seiten_master_v3.csv'
+MASTER_PATH = Path(__file__).resolve().parent / 'seiten_master_v4.csv'
 if not MASTER_PATH.exists():
-    MASTER_PATH = Path(__file__).resolve().parent.parent / 'seiten_master_v3.csv'
+    MASTER_PATH = Path(__file__).resolve().parent.parent / 'seiten_master_v4.csv'
 
 AMOUNT_COLUMNS = [('予算A', 255, 331), ('決算B', 331, 407), ('差異AB', 407, 483), ('備考', 483, 560)]
 
