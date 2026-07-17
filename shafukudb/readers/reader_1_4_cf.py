@@ -67,6 +67,18 @@
    「〜収入/収益」なら（何）事業収入、「〜支出」なら（何）支出へ帰属する
    (nanika_l3_by_child_suffix)。見出し名だけで収入側へ倒すと同名パターンの支出系を
    誤帰属する危険があるため、必ず子の末尾で収入/支出を判定する。
+
+■ フェーズ2-9: 縦罫線ベースの科目列切り出し + 深いstage対応(2025年度・誠和学園で確認)
+   (1) 科目名の分割トークン結合(extract_zoneC + subject_right_edge)。
+       extract_wordsが1科目名を字間で複数トークンに割り(例:「基本財産特定定期預金
+       取崩収入」が3分割)、右側トークンのx0が大きいため幻のstage4+が生まれ、
+       cur辞書KeyErrorやstage誤判定を起こしていた。金額列との境界は座標固定(255)では
+       なく予算(A)列の左側縦罫線から動的に取得し(WAMは列幅を動的に割る)、その罫線より
+       左の同一行(top近接)トークンを空白除去して1科目に連結する。1-4では同一行で親子を
+       表現しないため、この連結は安全。
+   (2) match_facilityのcur辞書を固定{0,1,2,3}からdefaultdictに変更し、任意深さの
+       stage(保育事業収入配下のstage3等)に対応。stage0見出しで全段リセット、stage
+       確定時に自分より深い段をクリアして、兄弟間の古い親の誤継承を防ぐ。
 """
 import csv
 import json
@@ -215,28 +227,70 @@ def page_table_top(p):
     return 110
 
 
+def subject_right_edge(p, default=254.9):
+    """科目列の右端x0(=予算(A)列の左側縦罫線)を返す(フェーズ2-9)。
+
+    WAMは列幅を列数で動的に割るため、金額列との境界も座標固定ではなく
+    ページごとに縦罫線から取るのが正しい。科目列左端(x0≈60)より右で最初に現れる
+    縦罫線を予算(A)列の左端とみなす。継続ページ等で縦罫線が取れない場合は
+    従来のハードコード値254.9(=default)にフォールバックする。
+    この右端より左が勘定科目、右が金額列。同一行で科目名がスペースにより複数
+    トークンに割れていても、この右端までは全て科目名の一部として結合してよい
+    (1-4では同一行で親子を表現することは無いため)。"""
+    vs = sorted(set(round(rc['x0'], 1) for rc in p.rects if rc['width'] < 3 and rc['height'] > 50))
+    cands = [v for v in vs if v > 70]
+    return cands[0] if cands else default
+
+
 def extract_zoneC(pdf, page_range):
-    """ゾーンC(x0>=60、横書き科目名)を上から順に、金額4列付きで抽出。"""
+    """ゾーンC(科目列、横書き科目名)を上から順に、金額4列付きで抽出。
+
+    (フェーズ2-9) 科目名の分割トークン結合:
+    pdfplumberのextract_wordsは、1つの科目名でも内部の字間が広いと複数トークンに
+    割る(例:「基本財産特定定期預金取崩収入」→「基本財産特定」「定期預金」「取崩収入」)。
+    従来は各トークンを独立行として扱い、右側トークンのx0が大きいため幻のstage4+を
+    生み、cur辞書のKeyErrorやstage誤判定を起こしていた。
+    1-4では同一行で親子を表現しないので、subject_right_edge(予算A左罫線)より左に
+    ある同一行(top近接)のトークンは、x0昇順に連結し空白を除去して1科目とする。
+    stage判定は連結後の左端トークンのx0で行う。"""
     rows = []
     for pi in page_range:
         p = pdf.pages[pi]
         words = p.extract_words(x_tolerance=1.5)
         t0 = page_table_top(p)
-        amt = [w for w in words if w['x0'] >= 255]
-        subj = [w for w in words if 60 <= w['x0'] < 255 and len(w['text']) >= 2 and w['top'] > t0]
-        subj.sort(key=lambda w: w['top'])
+        right = subject_right_edge(p)
+        amt = [w for w in words if w['x0'] >= right]
+        subj = [w for w in words if 60 <= w['x0'] < right and w['top'] > t0]
+        # 同一行(top近接<=1.5)のトークンをまとめる
+        subj.sort(key=lambda w: (w['top'], w['x0']))
+        by_top = []  # [(top_key, [words])]
         for w in subj:
+            placed = False
+            for entry in by_top:
+                if abs(entry[0] - w['top']) <= 1.5:
+                    entry[1].append(w)
+                    placed = True
+                    break
+            if not placed:
+                by_top.append((w['top'], [w]))
+        for top, ws in by_top:
+            ws.sort(key=lambda w: w['x0'])
+            name = normalize_name(''.join(w['text'] for w in ws).replace(' ', ''))
+            if len(name) < 2:
+                continue
+            left_x0 = ws[0]['x0']
             cols = {}
             for lb, lo, hi in AMOUNT_COLUMNS:
                 best, bd = None, 2.1
                 for a in amt:
                     if lo <= a['x0'] < hi:
-                        d = abs(a['top'] - w['top'])
+                        d = abs(a['top'] - top)
                         if d <= 2.0 and d < bd:
                             best, bd = a['text'], d
                 cols[lb] = best
-            rows.append({'page': pi, 'top': round(w['top'], 1), 'x0': round(w['x0'], 1),
-                         'name': normalize_name(w['text']), 'amounts': cols})
+            rows.append({'page': pi, 'top': round(top, 1), 'x0': round(left_x0, 1),
+                         'name': name, 'amounts': cols})
+    rows.sort(key=lambda r: (r['page'], r['top']))
     return rows
 
 
@@ -292,7 +346,10 @@ def match_facility(rows):
     """
     assign_indent_stage(rows)
     res = []
-    cur = {0: None, 1: None, 2: None, 3: None}  # stage -> 直近HITのCF index
+    # stage -> 直近HITのCF index。任意深さに対応(フェーズ2-9)。
+    # 従来は固定辞書{0,1,2,3}で、保育事業収入配下のstage3や、それ以上の深さが
+    # 出現するとKeyErrorでクラッシュしていた。defaultdictで任意段に対応する。
+    cur = defaultdict(lambda: None)
     last_hit_l1l2 = (None, None)  # stage0失敗時の収入/支出継承用
     for i, r in enumerate(rows):
         name, st = r['name'], r['stage']
@@ -319,10 +376,15 @@ def match_facility(rows):
                     nj2 = nanika_l3_by_child_suffix(child_names)
                     if nj2 is not None:
                         found, kind = nj2, 'L3（何）子先読み'
-            cur[0], cur[1], cur[2] = found, None, None
+            cur.clear()  # stage0見出しで全段リセット(深い段の値の誤継承を防ぐ)
+            cur[0] = found
         elif st >= 1 and cur[st - 1] is not None:
             found, kind = match_in_children(name, cur[st - 1])
             cur[st] = found
+            # 自分より深い段に残った古い値を消す(兄弟間での誤継承防止)
+            for s in list(cur):
+                if s > st:
+                    cur[s] = None
 
         if found is not None:
             code = CF[found]['code']
