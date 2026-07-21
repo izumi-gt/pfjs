@@ -22,6 +22,44 @@
 import pdfplumber
 import csv
 import re
+from collections import defaultdict
+
+# ---- 縦書き軸帯混入バグ対策(2026-07実測で確定) ----
+# 軸帯(x0<SUBJECT_X[0])の縦書き残骸文字のtopが、たまたま科目列の別行のtopと近いと、
+# pdfplumber.extract_words()がその行全体(科目名だけでなく金額列の数字も)を1文字ずつに
+# 分解してしまう現象を実PDFで確認(芸北福祉会・東広島市社協の2法人で再現)。
+# 対策1: 抽出後、同じtop・xギャップがほぼゼロの隣接語を再結合する(stitch)。
+#        集計行ラベルが軸帯へオーバーフローする正常系(現状のextract_words単発呼び出しで
+#        既に正しく1語になっているケース)は、gap_tol判定により変化しない。
+# 対策2: 縦書き軸帯の残骸文字(reader_1_4_cf.pyのdocstringに記載の17文字)のみで構成される
+#        語("るそ""収の"等)を法人固有として誤って拾わないよう除外する。
+#        マスタ(seiten_master_v4.csv)に3文字以下でこの17文字のみからなるleaf名は無いことを
+#        確認済み(誤除外リスクなし)。
+AXIS_RESIDUE_CHARS = set('事業活動施設整等そのに他よる収支')
+
+
+def stitch(words, gap_tol=0.15):
+    """同じtop・xギャップがgap_tol以下の隣接語を1語に再結合する。"""
+    by_top = defaultdict(list)
+    for w in words:
+        by_top[round(w['top'], 1)].append(dict(w))
+    out = []
+    for top, ws in by_top.items():
+        ws.sort(key=lambda w: w['x0'])
+        merged = []
+        for w in ws:
+            if merged and abs(w['x0'] - merged[-1]['x1']) <= gap_tol:
+                merged[-1]['text'] += w['text']
+                merged[-1]['x1'] = w['x1']
+            else:
+                merged.append(w)
+        out.extend(merged)
+    return out
+
+
+def is_axis_residue(t):
+    """語の全文字が縦書き軸帯の残骸文字集合のみで構成されるか。"""
+    return len(t) <= 3 and all(c in AXIS_RESIDUE_CHARS for c in t)
 
 # ---- 1-2 座標定数（華野・広島で罫線一致を確認済み）----
 SUBJECT_X = (54.5, 185.7)        # 勘定科目列
@@ -79,11 +117,13 @@ def extract_rows(pdf):
     絶対top閾値は使わず、x0とヘッダ語除外だけで判定（継続ページの独自topに非依存）。"""
     rows = []
     for pi, p in enumerate(pdf.pages):
-        words = p.extract_words()
+        words = stitch(p.extract_words())
         subjects = []
         for w in words:
             t = w['text']
             x0 = w['x0']
+            if is_axis_residue(t):
+                continue
             if SUBJECT_X[0] <= x0 < SUBJECT_X[1]:
                 if t == COL_HEADER:
                     continue

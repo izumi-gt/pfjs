@@ -48,6 +48,7 @@ import re
 import csv
 import pdfplumber
 from reader_1_2_cf import load_master_cf, run_match, leaf_name  # 照合層を流用
+from reader_1_2_cf import stitch, is_axis_residue  # 縦書き軸帯混入バグ対策(2026-07実測で確定)
 
 CAT = {'社会福祉事業区分': '社福', '公益事業区分': '公益', '収益事業区分': '収益'}
 SPECIAL = ('合計', '内部取引消去', '事業区分合計')
@@ -107,9 +108,11 @@ def extract_subjects(page, axis_lo, subj_lo, subj_hi):
     """(top, 科目名) を上から順に。科目列の語 + 軸帯の len>=5 集計ラベル。
     topの絶対閾値は使わない（頁ごとに行高・データ域が違うため）。"""
     out = []
-    for w in page.extract_words(x_tolerance=1.5):
+    for w in stitch(page.extract_words(x_tolerance=1.5)):
         t = w['text']
         if _is_excl_subject(t):
+            continue
+        if is_axis_residue(t):
             continue
         if subj_lo <= w['x0'] < subj_hi:
             out.append((round(w['top'], 1), t))
@@ -144,7 +147,7 @@ def extract_col_headers(page, amt_cols, first_data_top):
 
 def extract_amounts(page, tops, amt_cols):
     """(row_index, col_index) -> 金額文字列。列x範囲(中心)membership + top差<=3 で紐付け。"""
-    ws = page.extract_words(x_tolerance=3)
+    ws = stitch(page.extract_words(x_tolerance=3))
     nums = [w for w in ws if any(c.isdigit() for c in w['text'])
             and re.match(r'^[0-9,\.\u25b2\u25b3-]+$', w['text'])]
     g = {}

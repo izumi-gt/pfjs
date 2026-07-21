@@ -44,6 +44,7 @@ import re
 import csv
 import pdfplumber
 from reader_1_2_cf import load_master_cf, run_match, leaf_name  # 照合層を無改変流用
+from reader_1_2_cf import stitch, is_axis_residue  # 縦書き軸帯混入バグ対策(2026-07実測で確定)
 
 # 金額列のラベル（左→右）。第4列=備考はテキスト列で出力対象外。
 AMOUNT_LABELS = ['予算', '決算', '差異', '備考']
@@ -113,16 +114,18 @@ def extract_rows(pdf):
 
         # 科目・集計ラベル: ラベル領域[label_lo, subj_hi) の len>=2 語（縦書き残骸=len1を除外）
         subjects = []
-        for w in p.extract_words(x_tolerance=1.5):
+        for w in stitch(p.extract_words(x_tolerance=1.5)):
             t = w['text']
             if is_excl_subject(t):
+                continue
+            if is_axis_residue(t):
                 continue
             if label_lo <= w['x0'] < subj_hi and len(t) >= MIN_LABEL_LEN:
                 subjects.append((round(w['top'], 1), t))
         subjects.sort(key=lambda x: x[0])
 
         # 金額紐付け: 列中心x membership + |top差|<=TOP_TOL（右寄せ数値を最近傍で）
-        nums = p.extract_words(x_tolerance=3)
+        nums = stitch(p.extract_words(x_tolerance=3))
         for top, name in subjects:
             cells = {}
             for ci, (lo, hi) in enumerate(amt):
