@@ -111,6 +111,9 @@ def extract_rows(pdf):
         if len(rules) < 5:                     # 表のない頁はスキップ
             continue
         label_lo, subj_hi, amt = page_coords(rules)
+        # 表本体の上端罫線より上の語(法人名見出し等)は科目名から除外。
+        # 2026-07実測: 桜虹会型の「社会福祉法人」「法人名」2語分離への対策。
+        tt = min((r['top'] for r in p.rects), default=None)
 
         # 科目・集計ラベル: ラベル領域[label_lo, subj_hi) の len>=2 語（縦書き残骸=len1を除外）
         subjects = []
@@ -119,6 +122,8 @@ def extract_rows(pdf):
             if is_excl_subject(t):
                 continue
             if is_axis_residue(t):
+                continue
+            if tt is not None and w['top'] < tt - 1.0:
                 continue
             if label_lo <= w['x0'] < subj_hi and len(t) >= MIN_LABEL_LEN:
                 subjects.append((round(w['top'], 1), t))

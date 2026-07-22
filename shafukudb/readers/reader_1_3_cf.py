@@ -40,7 +40,8 @@
   列種別 ∈ {拠点, 合計, 内部取引消去, 事業区分合計}
 
 ■ 検算（三本柱・広島/華野で全NG=0を確認済み）
-  1. 列恒等式（全行・code非依存）: 合計=Σ拠点列 / 事業区分合計=合計-内部取引消去
+  1. 列恒等式（全行・code非依存）: 合計=Σ拠点列 / |合計−事業区分合計|=|内部取引消去|
+     （内部取引消去の符号は法人により正負まちまちのため絶対値で判定・2026-07実測）
   2. 数式連鎖（集計行・事業区分合計列）: (3)=(1)-(2)… 当期末=合計+前期末
   3. ブロック合算（位置ベース・code非依存）: 各「計」=直前ブロック明細行の和
 """
@@ -104,15 +105,29 @@ def _is_excl_subject(t):
     return False
 
 
+def table_top_of(page):
+    """表本体の上端（最も上の罫線rectのtop）。表の外側=罫線より上の見出し等を
+    データ行から除外するために使う。rectが無ければNone。"""
+    tops = [r['top'] for r in page.rects]
+    return min(tops) if tops else None
+
+
 def extract_subjects(page, axis_lo, subj_lo, subj_hi):
     """(top, 科目名) を上から順に。科目列の語 + 軸帯の len>=5 集計ラベル。
-    topの絶対閾値は使わない（頁ごとに行高・データ域が違うため）。"""
+    topの絶対閾値は使わない（頁ごとに行高・データ域が違うため）。
+    ただし表本体の上端罫線より上の語（法人名見出し等）は除外する。
+    2026-07実測: 桜虹会は法人名が「社会福祉法人」「桜虹会」の2語に分かれ、
+    後者(x0≈60)が科目名列に入り込みデータ先頭行として誤検出されていた
+    (他法人は「社会福祉法人○○」が1語でx0≈29のため軸帯より左=非該当)。"""
+    tt = table_top_of(page)
     out = []
     for w in stitch(page.extract_words(x_tolerance=1.5)):
         t = w['text']
         if _is_excl_subject(t):
             continue
         if is_axis_residue(t):
+            continue
+        if tt is not None and w['top'] < tt - 1.0:  # 表上端罫線より上=見出し等
             continue
         if subj_lo <= w['x0'] < subj_hi:
             out.append((round(w['top'], 1), t))
@@ -300,7 +315,10 @@ def verify_category(d):
             ci_chk += 1
             if fs != go:
                 ci_ng1 += 1
-        if jg is not None and go is not None and go - (nb or 0) != jg:
+        # 内部取引消去の符号は法人により正負まちまち(2026-07実測)。
+        # 固定式(合計-内部取引消去 等)ではなく、符号非依存の
+        # |合計 − 事業区分合計| == |内部取引消去| で判定する(§符号問題_決着報告)。
+        if jg is not None and go is not None and abs(go - jg) != abs(nb or 0):
             ci_ng2 += 1
 
     # 縦検算に使う列（事業区分合計 > 合計 > 先頭拠点）

@@ -14,7 +14,8 @@
     括弧・演算子を除去して照合（照合時正規化。マスタ本体は無改変）。
 
 検算:
-  - 列恒等式（全行）: 合計=社福+公益+収益 / 法人合計=合計−内部消去。code非依存。
+  - 列恒等式（全行）: 合計=社福+公益+収益 / |合計−法人合計|=|内部消去|。code非依存。
+    （内部消去の符号は法人により正負まちまちのため絶対値で判定・2026-07実測）
   - 縦の数式連鎖（集計行）: (3)=(1)-(2), (6)=(4)-(5), (9)=(7)-(8),
     当期資金収支差額合計=(3)+(6)+(9), 当期末=合計+前期末。
   - ブロック合算（位置ベース）: 各「計」行 = 直前ブロック行の法人合計和（HIT+法人固有）。
@@ -118,11 +119,17 @@ def extract_rows(pdf):
     rows = []
     for pi, p in enumerate(pdf.pages):
         words = stitch(p.extract_words())
+        # 表本体の上端罫線より上の語(法人名見出し等)は科目名から除外。
+        # 2026-07実測: 桜虹会は法人名が「社会福祉法人」「桜虹会」の2語に分かれ、
+        # 後者(x0≈67)が科目名列に入り込むため。他法人は1語(x0≈29)で非該当。
+        tt = min((r['top'] for r in p.rects), default=None)
         subjects = []
         for w in words:
             t = w['text']
             x0 = w['x0']
             if is_axis_residue(t):
+                continue
+            if tt is not None and w['top'] < tt - 1.0:
                 continue
             if SUBJECT_X[0] <= x0 < SUBJECT_X[1]:
                 if t == COL_HEADER:
@@ -262,7 +269,15 @@ def run_match(rows, cf):
 
 # ---------------- 検算 ----------------
 def verify_column_identity(results):
-    """全行: 合計=社福+公益+収益 / 法人合計=合計−内部消去。空欄は0とみなす。"""
+    """全行: 合計=社福+公益+収益 / |合計−法人合計|=|内部消去|。空欄は0とみなす。
+
+    内部消去(内部取引消去)列の符号は法人により正負まちまちで記載される
+    (2026-07実測: あと会は正値、桜虹会は負値)。加えて差額/残高系の行では
+    合計が負で内部消去が正になるケースもある。よって固定式(合計−内部消去 や
+    合計+内部消去、合計−|内部消去|)はいずれも一部の法人・行でしか合わない。
+    会計的に正しい普遍法則は「合計と法人合計の差の大きさ＝相殺控除額の大きさ」、
+    すなわち |合計 − 法人合計| == |内部消去| であり、検証した全ケースで成立する。
+    符号の記載流派に依存しないこの式で判定する。"""
     ng = []
     checked = 0
     for r in results:
@@ -274,8 +289,8 @@ def verify_column_identity(results):
         checked += 1
         if sf + ko + sy != go:
             ng.append(('合計', r['name'], f'{sf}+{ko}+{sy}≠{go}'))
-        if ho is not None and go - (nb or 0) != ho:
-            ng.append(('法人合計', r['name'], f'{go}-{nb or 0}≠{ho}'))
+        if ho is not None and abs(go - ho) != abs(nb or 0):
+            ng.append(('法人合計', r['name'], f'|{go}-{ho}|≠|{nb or 0}|'))
     return checked, ng
 
 
