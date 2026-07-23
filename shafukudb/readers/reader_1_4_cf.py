@@ -421,14 +421,33 @@ def match_facility(rows):
 
 
 # ---------------- 拠点分割・法人名 ----------------
+def _is_facility_title(text):
+    """タイトル行のトークンが拠点名か判定する（2026-07実測で確定）。
+
+    旧実装は '拠点区分' の部分一致でページ上部の最初の該当語を拠点名にしていたが、
+    科目名「拠点区分間長期借入金収入」「拠点区分間その他の委託費支出」等も
+    '拠点区分' を含むため、これらがページ上部に来ると拠点名として誤検出し、
+    複数拠点が1バケツに混ざって検算NGを起こしていた（法輪福祉会・大崎福祉会で確認）。
+
+    実測した判別軸: 本物の拠点名トークンは必ず「…拠点区分」で終わる
+    （例: 「本部拠点区分拠点区分」「大崎荘拠点区分」「ケアハウス拠点区分」）のに対し、
+    科目名は「拠点区分間…」のように '拠点区分' の直後に文字が続く。よって末尾一致で
+    確実に切り分けられる（正常系5法人・誤検出2法人の全ページで確認）。
+    保険として「拠点区分間」で始まる語も明示的に除外する。"""
+    if '拠点区分間' in text:
+        return False
+    return text.endswith('拠点区分')
+
+
 def detect_facility_boundaries(pdf):
     bounds = []
     for pi, p in enumerate(pdf.pages):
         for w in p.extract_words(x_tolerance=1.5):
-            if '拠点区分' in w['text'] and w['top'] < 90:
+            if w['top'] < 90 and _is_facility_title(w['text']):
                 bounds.append((pi, w['text']))
                 break
     return bounds
+
 
 
 def build_facility_ranges(pdf):
