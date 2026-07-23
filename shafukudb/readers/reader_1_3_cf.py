@@ -74,10 +74,17 @@ def vertical_rules(page):
 
 def page_coords(rules):
     """rules -> (axis_lo, subj_lo, subj_hi, amount_columns[(lo,hi),...])。
-    rules[0]=外枠左, rules[2]=科目列左, rules[3]=科目列右(=第1金額列左)。金額列=rules[3:]。"""
-    axis_lo, subj_lo, subj_hi = rules[0], rules[2], rules[3]
-    amt = [(rules[i], rules[i + 1]) for i in range(3, len(rules) - 1)]
-    return axis_lo, subj_lo, subj_hi, amt
+    科目列=最大幅の区間（金額列より明確に広い）。金額列=科目列右端以降の罫線群。
+    軸帯左端=外枠左(rules[0])。
+    2026-07実測: 改ページで軸帯内部の区切り罫線が欠落し縦罫線本数が変わる
+    （みらい1-3: p0=8本→p1=7本）ため、位置依存(rules[2]/rules[3]決め打ち)だと
+    2ページ目で科目列を1本ぶん取り違え、金額を科目名として誤抽出していた。
+    最大幅区間で科目列を同定することで罫線本数の増減に頑健化（1-1と同方式）。"""
+    gaps = [(rules[i + 1] - rules[i], i) for i in range(len(rules) - 1)]
+    _, idx = max(gaps, key=lambda g: g[0])
+    subj_lo, subj_hi = rules[idx], rules[idx + 1]
+    amt = [(rules[i], rules[i + 1]) for i in range(idx + 1, len(rules) - 1)]
+    return rules[0], subj_lo, subj_hi, amt
 
 
 def title_of(page):
