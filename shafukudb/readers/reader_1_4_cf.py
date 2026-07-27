@@ -225,12 +225,45 @@ def nanika_l3_for(name, zone=None):
     return NANIKA_L3.get(sfx)
 
 
-def nanika_l3_by_child_suffix(child_names, zone=None):
-    """子科目名の接尾辞から親の(何)L3を推定する（stage0見出しが曖昧な場合の先読み）。"""
-    for cn in child_names:
-        j = nanika_l3_for(cn, zone)
+def _nanika_pick(sfx, zone=None, alt=None):
+    """接尾辞→(何)ノード。現在区画を最優先し、区画内に無ければ代替接尾辞(alt)も
+    同じ区画内で試す。それでも無ければグローバルへフォールバックする。
+    altを区画内で先に試すのは、区画をまたいだ誤帰属(パターン①)を防ぐため。"""
+    if zone is not None:
+        j = NANIKA_BY_ZONE.get((zone, sfx))
         if j is not None:
             return j
+        if alt is not None:
+            j = NANIKA_BY_ZONE.get((zone, alt))
+            if j is not None:
+                return j
+    j = NANIKA_L3.get(sfx)
+    if j is None and alt is not None:
+        j = NANIKA_L3.get(alt)
+    return j
+
+
+def nanika_l3_by_child_suffix(child_names, zone=None):
+    """子科目名の接尾辞から親の(何)L3を推定する（stage0見出しが曖昧な場合の先読み）。
+
+    社会福祉法人会計基準のCFでは末端勘定は必ず〜収入/〜収益または〜支出で終わる。
+    子を持つstage0見出しは「（何）事業」のグルーピングなので、収入系の子を持つ場合は
+    単独枠の（何）収入ではなく、子を持てる（何）事業収入へ帰属させる（旧版からの仕様）。
+    また CF側マスタには「（何）収益」が存在しない（（何）収益はPL側のみで、
+    load_master_cf が L0=='CF' で絞るため対象外）。そのため「〜収益」で終わる子は
+    事業収入側として救済する。
+    2026-07: 区画対応化のリファクタでこの救済ルールを落としてしまい、収益表記中心の
+    法人(広島いのちの電話)で収入がまるごと未集計になる退行を起こしたため復元した。
+    区画内に（何）事業収入が無い区画(施設整備等/その他の活動)では、区画内の
+    （何）収入へ寄せる(_nanika_pick の alt)ことで区画またぎの誤帰属を避ける。
+    """
+    for cn in child_names:
+        if cn[-4:] in ('事業収入', '事業収益'):
+            return _nanika_pick(cn[-4:], zone, alt='事業収入')
+        if cn[-2:] in ('収入', '収益'):
+            return _nanika_pick('事業収入', zone, alt='収入')
+        if cn[-2:] == '支出':
+            return _nanika_pick('支出', zone)
     return None
 
 
