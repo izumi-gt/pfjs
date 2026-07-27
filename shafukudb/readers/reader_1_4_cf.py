@@ -87,9 +87,9 @@ from pathlib import Path
 
 import pdfplumber
 
-MASTER_PATH = Path(__file__).resolve().parent / 'seiten_master_v4.csv'
+MASTER_PATH = Path(__file__).resolve().parent / 'seiten_master_v5.csv'
 if not MASTER_PATH.exists():
-    MASTER_PATH = Path(__file__).resolve().parent.parent / 'seiten_master_v4.csv'
+    MASTER_PATH = Path(__file__).resolve().parent.parent / 'seiten_master_v5.csv'
 
 AMOUNT_COLUMNS = [('予算A', 255, 331), ('決算B', 331, 407), ('差異AB', 407, 483), ('備考', 483, 560)]
 
@@ -159,52 +159,81 @@ for _j in BY_DEPTH[3]:
     L3_NAME[leaf_name(CF[_j])].append(_j)
 
 # L3(何)の接尾辞→index
+# 区画(ゾーン)対応の（何）解決（2026-07 実測で導入）。
+# 旧実装は BY_DEPTH[3] のみ走査し「接尾辞→ノード1つ」を代入していたため、
+# その他の活動/施設整備等の区画に出た法人固有科目まで CF-01側の（何）へ誤誘導していた
+# （宗越福祉会で実証: 介護福祉士修学資金貸付金支出 680,000 が CF-01-03-006 に吸われ、
+#  事業活動支出計が過大・その他の活動支出計が過小になっていた）。
+# 全depthを走査して区画別に候補を持ち、各区画で最も浅いノードを代表とする。
+_NANIKA_SUFFIXES = ('事業収入', '事業収益', '収入', '支出', '収益')
+NANIKA_BY_ZONE = {}
 NANIKA_L3 = {}
-for _j in BY_DEPTH[3]:
-    _n = leaf_name(CF[_j])
-    if _n == '（何）事業収入':
-        NANIKA_L3['事業収入'] = _j
-    elif _n == '（何）事業収益':
-        NANIKA_L3['事業収益'] = _j
-    elif _n == '（何）収入':
-        NANIKA_L3['収入'] = _j
-    elif _n == '（何）支出':
-        NANIKA_L3['支出'] = _j
-    elif _n == '（何）収益':
-        NANIKA_L3['収益'] = _j
+_cand = {}
+for _j, _r in enumerate(CF):
+    _code = _r['code']
+    _n = leaf_name(_r)
+    for _sfx in _NANIKA_SUFFIXES:
+        if _n == f'（何）{_sfx}':
+            _seg_ = _code.split('-')
+            if len(_seg_) >= 3:
+                _cand.setdefault(('-'.join(_seg_[:3]), _sfx), []).append(
+                    (code_depth(_code), _code, _j))
+            break
+for _k, _lst in _cand.items():
+    _lst.sort()
+    NANIKA_BY_ZONE[_k] = _lst[0][2]
+for (_z, _sfx), _j in NANIKA_BY_ZONE.items():
+    _prev = NANIKA_L3.get(_sfx)
+    if _prev is None or (code_depth(CF[_j]['code']), CF[_j]['code']) < \
+            (code_depth(CF[_prev]['code']), CF[_prev]['code']):
+        NANIKA_L3[_sfx] = _j
+
+# CF様式の法令固定順。区画マーカー(横書き固定文字列)通過で現在区画を進める。
+ZONE_FIRST = 'CF-01-01'
+ZONE_AFTER_MARKER = [
+    ('事業活動収入計', 'CF-01-03'),
+    ('事業活動支出計', 'CF-03-01'),
+    ('施設整備等収入計', 'CF-03-03'),
+    ('施設整備等支出計', 'CF-05-01'),
+    ('その他の活動収入計', 'CF-05-03'),
+    ('その他の活動支出計', None),
+]
 
 
-def nanika_l3_for(name):
-    """L3実名に当たらない科目を、接尾辞で(何)L3へ帰属。該当なしはNone(法人特有)。"""
+def zone_after(name):
+    """行名が区画マーカーなら通過後の区画を返す。マーカーでなければ False。"""
+    for _base, _nxt in ZONE_AFTER_MARKER:
+        if name.startswith(_base):
+            return _nxt
+    return False
+
+
+def nanika_l3_for(name, zone=None):
+    """L3実名に当たらない科目を、接尾辞で(何)へ帰属。該当なしはNone(法人特有)。
+    zone を渡すとその区画の候補を優先し、無ければグローバルへフォールバックする。"""
+    sfx = None
     if name[-4:] in ('事業収入', '事業収益'):
-        return NANIKA_L3.get(name[-4:])
-    if name[-2:] in ('収入', '支出', '収益'):
-        return NANIKA_L3.get(name[-2:])
-    return None
+        sfx = name[-4:]
+    elif name[-2:] in ('収入', '支出', '収益'):
+        sfx = name[-2:]
+    if sfx is None:
+        return None
+    if zone is not None:
+        j = NANIKA_BY_ZONE.get((zone, sfx))
+        if j is not None:
+            return j
+    return NANIKA_L3.get(sfx)
 
 
-def nanika_l3_by_child_suffix(child_names):
-    """(フェーズ2-8) stage0の見出し自身が収入/支出を判別できない名前
-    (例:「高次脳機能障害支援体制整備事業」のように末尾が「事業」で止まる)のとき、
-    直後の子科目名の末尾から収入/支出を判定して(何)L3へ帰属する。
-
-    社会福祉法人会計基準のCF(資金収支計算書)では末端勘定は必ず「〜収入/収益」または
-    「〜支出」で終わるため、子の末尾を見れば収入側/支出側が確実に分かる。見出し名だけで
-    機械的に収入側へ倒すと、同じ「〜事業」命名の支出系プログラムを誤帰属する危険がある
-    (izumi氏指摘)ので、必ず子の末尾で判定する。
-    child_names: 見出し直後に続く子科目名のリスト(浅い順)。
-    戻り値: (何)L3のindex or None。"""
+def nanika_l3_by_child_suffix(child_names, zone=None):
+    """子科目名の接尾辞から親の(何)L3を推定する（stage0見出しが曖昧な場合の先読み）。"""
     for cn in child_names:
-        if cn[-4:] in ('事業収入', '事業収益'):
-            return NANIKA_L3.get(cn[-4:])
-        if cn[-2:] in ('収入', '収益'):
-            return NANIKA_L3.get('事業収入')  # 収入側 → （何）事業収入
-        if cn[-2:] == '支出':
-            return NANIKA_L3.get('支出')       # 支出側 → （何）支出
+        j = nanika_l3_for(cn, zone)
+        if j is not None:
+            return j
     return None
 
 
-# ---------------- 抽出(ゾーンC) ----------------
 def page_table_top(p):
     """そのページで科目抽出を開始すべきtop位置を返す。
     - 通常ページ: 表ヘッダー帯の下端(x0≈39.7の水平線ペア)の下側。
@@ -351,6 +380,7 @@ def match_facility(rows):
     # 出現するとKeyErrorでクラッシュしていた。defaultdictで任意段に対応する。
     cur = defaultdict(lambda: None)
     last_hit_l1l2 = (None, None)  # stage0失敗時の収入/支出継承用
+    zone = ZONE_FIRST             # 現在の区画(区画マーカー通過で進める)
     for i, r in enumerate(rows):
         name, st = r['name'], r['stage']
         found, kind = None, None
@@ -361,7 +391,7 @@ def match_facility(rows):
             elif name in L3_NAME:
                 found, kind = L3_NAME[name][0], 'L3'
             else:
-                nj = nanika_l3_for(name)
+                nj = nanika_l3_for(name, zone)
                 if nj is not None:
                     found, kind = nj, 'L3（何）'
                 else:
@@ -373,7 +403,7 @@ def match_facility(rows):
                         if r2['stage'] == 0:
                             break
                         child_names.append(r2['name'])
-                    nj2 = nanika_l3_by_child_suffix(child_names)
+                    nj2 = nanika_l3_by_child_suffix(child_names, zone)
                     if nj2 is not None:
                         found, kind = nj2, 'L3（何）子先読み'
             cur.clear()  # stage0見出しで全段リセット(深い段の値の誤継承を防ぐ)
@@ -417,6 +447,12 @@ def match_facility(rows):
             res.append({**r, 'status': '法人特有', 'code': None, 'kind': None,
                         'master_name': None, 'pseudo_code': pseudo,
                         'pool_parent': pool_parent, 'pool_depth': pool_depth})
+
+        # 区画マーカーを通過したら次区画へ（この行の処理後に更新）
+        if st == 0:
+            _nxt = zone_after(name)
+            if _nxt is not False:
+                zone = _nxt
     return res
 
 

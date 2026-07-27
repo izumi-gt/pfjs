@@ -34,7 +34,7 @@ from collections import defaultdict
 #        既に正しく1語になっているケース)は、gap_tol判定により変化しない。
 # 対策2: 縦書き軸帯の残骸文字(reader_1_4_cf.pyのdocstringに記載の17文字)のみで構成される
 #        語("るそ""収の"等)を法人固有として誤って拾わないよう除外する。
-#        マスタ(seiten_master_v4.csv)に3文字以下でこの17文字のみからなるleaf名は無いことを
+#        マスタ(seiten_master_v5.csv)に3文字以下でこの17文字のみからなるleaf名は無いことを
 #        確認済み(誤除外リスクなし)。
 AXIS_RESIDUE_CHARS = set('事業活動施設整等そのに他よる収支')
 
@@ -79,7 +79,7 @@ AXIS_LABEL_MINLEN = 5            # 軸帯に割込む集計ラベルの最小長
 
 
 # ---------------- マスタ（照合層は流用可能な共通ヘルパ）----------------
-def load_master_cf(path='seiten_master_v4.csv'):
+def load_master_cf(path='seiten_master_v5.csv'):
     with open(path, encoding='utf-8-sig', newline='') as f:
         rows = list(csv.DictReader(f))
     return [r for r in rows if r['L0コード'] == 'CF']
@@ -166,39 +166,85 @@ def code_depth(code):
     return d
 
 
+# ---- 区画(ゾーン)対応の（何）解決（2026-07 実測で導入）----
+# CF様式は会計基準により「事業活動収入→事業活動支出→施設整備等収入→施設整備等支出→
+# その他の活動収入→その他の活動支出」の固定順。各区画の終端に現れる「〜計」マーカーは
+# 横書きの固定文字列で全法人安定して出現するため、これを数えるだけで現在区画が分かる
+# （縦書き軸帯は一切読まない）。
+# 旧実装は depth3 のみ走査して「接尾辞→ノード1つ」を代入していたため、
+# CF-01側の（何）に固定され、その他の活動/施設整備等の区画で誤帰属していた。
+ZONE_FIRST = 'CF-01-01'
+ZONE_AFTER_MARKER = [
+    ('事業活動収入計', 'CF-01-03'),
+    ('事業活動支出計', 'CF-03-01'),
+    ('施設整備等収入計', 'CF-03-03'),
+    ('施設整備等支出計', 'CF-05-01'),
+    ('その他の活動収入計', 'CF-05-03'),
+    ('その他の活動支出計', None),      # 以降は予備費/差額/残高など区画外
+]
+_NANIKA_SUFFIXES = ('事業収入', '事業収益', '収入', '支出', '収益')
+
+
+def zone_after(name):
+    """行名が区画マーカーなら通過後の区画を返す。マーカーでなければ False。"""
+    t = strip_formula(name)
+    for base, nxt in ZONE_AFTER_MARKER:
+        if t.startswith(base):
+            return nxt
+    return False
+
+
 def _build_nanika_l3(cf):
-    """cf から (何) L3 catch-all の {接尾辞: index} を作る。
-    対象は depth3(=L3)の記号的 catch-all 科目名のみ。CFには（何）事業収入/
-    （何）収入/（何）支出 が存在する（（何）事業収益/（何）収益 はCFには無い）。"""
-    m = {}
+    """cf から (何) catch-all を {(区画, 接尾辞): index} と {接尾辞: index} の両方で作る。
+    全depthを走査し、各区画で最も浅い候補を代表とする（区画直下の一般的な枠を優先）。
+    互換用のグローバル辞書は depth の浅い順・CF-01優先で決定的に選ぶ（旧実装は
+    走査順に依存した上書きだったため、同名ノードが増えると挙動が不定になっていた）。"""
+    cand = {}
     for j, r in enumerate(cf):
-        if code_depth(r['code']) != 3:
-            continue
+        code = r['code']
         n = leaf_name(r)
-        if n == '（何）事業収入':
-            m['事業収入'] = j
-        elif n == '（何）事業収益':
-            m['事業収益'] = j
-        elif n == '（何）収入':
-            m['収入'] = j
-        elif n == '（何）支出':
-            m['支出'] = j
-        elif n == '（何）収益':
-            m['収益'] = j
+        for sfx in _NANIKA_SUFFIXES:
+            if n == f'（何）{sfx}':
+                seg = code.split('-')
+                if len(seg) >= 3:
+                    zone = '-'.join(seg[:3])
+                    cand.setdefault((zone, sfx), []).append((code_depth(code), code, j))
+                break
+    m = {}
+    for key, lst in cand.items():
+        lst.sort()
+        m[key] = lst[0][2]
+    # グローバル(区画不明時)のフォールバック
+    for (zone, sfx), j in list(m.items()):
+        prev = m.get(sfx)
+        if prev is None:
+            m[sfx] = j
+        else:
+            cur = (code_depth(cf[j]['code']), cf[j]['code'])
+            old = (code_depth(cf[prev]['code']), cf[prev]['code'])
+            if cur < old:
+                m[sfx] = j
     return m
 
 
-def nanika_l3_for(name, nmap):
-    """L3実名に当たらない科目を、接尾辞で(何)L3へ帰属。
+def nanika_l3_for(name, nmap, zone=None):
+    """L3実名に当たらない科目を、接尾辞で(何)へ帰属。
     まず4文字接尾辞（事業収入/事業収益）→（何）事業収入 系を優先し、
     次に2文字接尾辞（収入/支出/収益）→（何）収入/（何）支出 系で判定する。
-    （何）事業収入→（何）収入/（何）支出 の順に評価する（izumi氏指摘の照合順序）。
+    zone を渡した場合はその区画の候補を優先し、無ければグローバルへフォールバック。
     該当なしはNone（真の法人固有）。"""
+    sfx = None
     if name[-4:] in ('事業収入', '事業収益'):
-        return nmap.get(name[-4:])
-    if name[-2:] in ('収入', '支出', '収益'):
-        return nmap.get(name[-2:])
-    return None
+        sfx = name[-4:]
+    elif name[-2:] in ('収入', '支出', '収益'):
+        sfx = name[-2:]
+    if sfx is None:
+        return None
+    if zone is not None:
+        j = nmap.get((zone, sfx))
+        if j is not None:
+            return j
+    return nmap.get(sfx)
 
 
 def run_match(rows, cf):
@@ -240,14 +286,19 @@ def run_match(rows, cf):
         if len(cand) == 1:
             resolved[i] = cand[0]
 
-    # --- Stage2: 未解決を末尾接尾辞で(何)L3へ帰属 ---
+    # --- Stage2: 未解決を末尾接尾辞で(何)へ帰属（区画カウンタ併用）---
+    # 行を上から順に走査し、区画マーカー通過で現在区画を進める。1-1/1-2/1-3は
+    # インデント情報を持たないフラット照合だが、区画だけは順序から確定できる。
     nmap = _build_nanika_l3(cf)
+    zone = ZONE_FIRST
     for i, row in enumerate(rows):
-        if resolved[i] is not None:
-            continue
-        j = nanika_l3_for(row['name'], nmap)
-        if j is not None:
-            resolved[i] = j
+        if resolved[i] is None:
+            j = nanika_l3_for(row['name'], nmap, zone)
+            if j is not None:
+                resolved[i] = j
+        nxt = zone_after(row['name'])
+        if nxt is not False:
+            zone = nxt
 
     # --- 整形 ---
     results = []
