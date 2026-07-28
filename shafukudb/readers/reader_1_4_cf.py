@@ -559,6 +559,11 @@ def process_pdf(pdf_path, statement='CF'):
     return all_rows
 
 
+# 自ノードの検算 expected に採用する kind（科目名そのものが一致したもの）。
+# '（何）'系は placeholder への吸収なので、単独行なら expected に含めない。
+EXPECTED_KINDS = frozenset({'L2', 'L3', '実名'})
+
+
 def _pool_amounts_by_parent(fac_rows):
     """法人特有行のプール金額を pool_parent ごとに集計する(フェーズ2-7)。
 
@@ -607,11 +612,32 @@ def _verify_one_facility(fac_rows, master):
     (フェーズ2-7) 法人特有行の金額を pool_parent 経由でプールし、その親ノードの
     計算値に加算する。マスタに無い科目の行落ちで親集計が合わないNGを、法人特有の
     まま(=一覧に残したまま)帳尻だけ合わせる。
+    (2026-07) is_total ノードへの直接ヒットの扱い:
+    法人が大区分に自前の科目(例「選挙広報・名簿製作事業収入」)を立てると、末尾接尾辞に
+    より (何) placeholder ノード(例 CF-01-01-017-000-000)へ吸収される。この値は当該
+    小計の構成要素ではなく「兄弟」なので、そのまま expected に足すと子の合計と食い違い
+    NGになる(広島県視覚障害者団体連合会・寿老園ほか、全440法人中7法人で発生)。
+    そこで expected には「実名一致でヒットした行」と「子を従える見出し行」だけを使う
+    (amt_exp)。上位集計へ伝播する amt は従来どおり全HITを合算するため、事業活動収入計
+    などの上位検算には一切影響しない。印字された小計行が無い場合は検算不能としてSKIP。
+    検出力は維持される(印字された小計と子の合計が食い違えば従来どおりNG)。
+
     戻り値: (ok, ng, skip, ng_list, pool_warnings)。ng_listは (code, 期待値, 計算値)。"""
-    amt = {}
-    for r in fac_rows:
+    # is_total ノードの「印字された小計行」だけを expected に使うための判定。
+    # 次の行の stage が自分より深ければ、その行は子を従える見出し(=小計行)。
+    is_header = [False] * len(fac_rows)
+    for _i, _r in enumerate(fac_rows):
+        if _i + 1 < len(fac_rows) and fac_rows[_i + 1]['stage'] > _r['stage']:
+            is_header[_i] = True
+
+    amt = {}       # 上位集計へ伝播する値。従来どおり全HITを合算する(変更しない)
+    amt_exp = {}   # 自ノードの検算 expected 専用。実名一致 or 見出し行のみを集める
+    for _i, r in enumerate(fac_rows):
         if r['status'] == 'HIT' and r['code'] and r['決算B'] is not None:
-            amt[r['code']] = amt.get(r['code'], 0) + parse_amount(r['決算B'])
+            _v = parse_amount(r['決算B'])
+            amt[r['code']] = amt.get(r['code'], 0) + _v
+            if r.get('kind') in EXPECTED_KINDS or is_header[_i]:
+                amt_exp[r['code']] = amt_exp.get(r['code'], 0) + _v
 
     pool_by_parent, pool_warnings = _pool_amounts_by_parent(fac_rows)
 
@@ -627,9 +653,15 @@ def _verify_one_facility(fac_rows, master):
         if all(c['code'] not in amt for c in ch) and code not in pool_by_parent:
             skip += 1
             continue
+        if code in amt and code not in amt_exp:
+            # 値は乗っているが、印字された小計行(実名一致 or 見出し)が無い。
+            # (何)placeholder に吸収された法人独自の大区分行だけが乗っている状態で、
+            # 比較対象となる小計が存在しないため検算不能としてSKIPする。
+            skip += 1
+            continue
         tot = sum((amt.get(c['code']) or 0) * (1 if c['sign'] == '+' else -1) for c in ch)
         tot += pool_by_parent.get(code, 0)  # このノード自身にプールされた法人特有金額
-        expected = amt.get(code, 0)
+        expected = amt_exp.get(code, 0)
         if tot == expected:
             ok += 1
         else:
