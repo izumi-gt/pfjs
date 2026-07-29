@@ -615,41 +615,6 @@ def _pool_amounts_by_parent(fac_rows):
     return dict(pool_by_parent), warnings
 
 
-EXPECTED_KINDS = frozenset({'L2', 'L3', '実名'})
-
-
-def _pool_amounts_by_parent(fac_rows):
-    """法人特有行のプール金額を pool_parent ごとに集計する(フェーズ2-7)。
-
-    二重計上防止: 同一 pool_parent 配下に複数段(見出し+明細)がある場合、
-    最も深い pool_depth の行だけを採用する。見出し=明細合計の2段組で
-    見出しと明細を両方足す誤りを防ぐ。
-
-    金額矛盾チェック: 同一 pool_parent 配下で「浅い段の合計」と「最深段の合計」が
-    どちらも非ゼロなのに一致しない場合、単純な見出し=明細ではない可能性があるため
-    警告に載せる(検算は最深段採用で続行)。
-
-    戻り値: (pool_by_parent: {parent_code: 採用金額}, warnings: [str])。
-    """
-    from collections import defaultdict as _dd
-    by_parent_depth = _dd(lambda: _dd(int))  # parent -> depth -> 金額合計
-    for r in fac_rows:
-        if r['status'] == '法人特有' and r.get('pool_parent') and r.get('決算B') is not None:
-            d = r.get('pool_depth') or 1
-            by_parent_depth[r['pool_parent']][d] += parse_amount(r['決算B'])
-
-    pool_by_parent = {}
-    warnings = []
-    for parent, depth_map in by_parent_depth.items():
-        depths = sorted(depth_map)
-        deepest = depths[-1]
-        pool_by_parent[parent] = depth_map[deepest]
-        for d in depths[:-1]:
-            if depth_map[d] != 0 and depth_map[d] != depth_map[deepest]:
-                warnings.append(
-                    f'{parent}: プール金額の段間不一致 '
-                    f'(depth{d}={depth_map[d]:,} vs depth{deepest}={depth_map[deepest]:,})')
-    return pool_by_parent, warnings
 
 
 def _verify_one_facility(fac_rows, master):
