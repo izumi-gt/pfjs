@@ -567,6 +567,60 @@ EXPECTED_KINDS = frozenset({'L2', 'L3', '実名'})
 def _pool_amounts_by_parent(fac_rows):
     """法人特有行のプール金額を pool_parent ごとに集計する(フェーズ2-7)。
 
+    二重計上防止は「行単位」で判定する(2026-07 変更)。
+    ある法人特有行の直後の行が自分より深い段なら、その行は見出しであり金額は明細の
+    合計と重複するため採用しない。そうでなければ内訳を持たない単独項目なので採用する。
+    判定基準は _verify_one_facility の is_header と同じ「次行の stage が自分より深いか」。
+
+    旧実装は pool_parent 配下を pool_depth でグルーピングし「最深段の合計だけ」を
+    採用していた。これは「1つの見出し+その明細」という2段構造しか想定しておらず、
+    同一祖先の下に複数の独立した法人特有科目が並び、そのうち一部だけが内訳を持つ場合に、
+    内訳を持たない項目まで一律に切り捨てていた
+    (若菜: 1項目 2,646,172円 / 広島県社会福祉協議会: 12項目 15,822,200円が消失)。
+    行単位判定なら、見出し+明細の2段組(あと会・東広島の36箇所で確認)も
+    単独項目の混在も同時に正しく扱える。
+
+    金額矛盾チェック: 見出し行の金額がその直下明細の合計と一致しない場合に警告を出す
+    (検算は明細側を採用して続行)。
+
+    戻り値: (pool_by_parent: {parent_code: 採用金額}, warnings: [str])。
+    """
+    pool_by_parent = defaultdict(int)
+    warnings = []
+    n = len(fac_rows)
+    for i, r in enumerate(fac_rows):
+        if r['status'] != '法人特有' or not r.get('pool_parent'):
+            continue
+        parent = r['pool_parent']
+        nxt = fac_rows[i + 1] if i + 1 < n else None
+        is_header = bool(nxt and nxt['stage'] > r['stage'])
+        if is_header:
+            # 見出しは採用しない(明細側で拾う)。金額が明細合計と合わなければ警告。
+            if r['決算B'] is not None:
+                own = parse_amount(r['決算B'])
+                csum = 0
+                for j in range(i + 1, n):
+                    r2 = fac_rows[j]
+                    if r2['stage'] <= r['stage']:
+                        break
+                    if (r2['stage'] == r['stage'] + 1 and r2['status'] == '法人特有'
+                            and r2['決算B'] is not None):
+                        csum += parse_amount(r2['決算B'])
+                if own != csum:
+                    warnings.append(
+                        f'{parent}: 法人特有見出し「{r["name"]}」={own:,} が '
+                        f'明細合計={csum:,} と不一致')
+        elif r['決算B'] is not None:
+            pool_by_parent[parent] += parse_amount(r['決算B'])
+    return dict(pool_by_parent), warnings
+
+
+EXPECTED_KINDS = frozenset({'L2', 'L3', '実名'})
+
+
+def _pool_amounts_by_parent(fac_rows):
+    """法人特有行のプール金額を pool_parent ごとに集計する(フェーズ2-7)。
+
     二重計上防止: 同一 pool_parent 配下に複数段(見出し+明細)がある場合、
     最も深い pool_depth の行だけを採用する。見出し=明細合計の2段組で
     見出しと明細を両方足す誤りを防ぐ。
