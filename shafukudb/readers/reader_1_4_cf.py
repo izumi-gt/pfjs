@@ -273,10 +273,19 @@ def page_table_top(p):
     - 継続ページ(フェーズ2-6で追加): 表ヘッダーが再描画されず水平線が検出できないが、
       縦罫線がページ最上部近く(top<60)から始まっている場合、それは見出し無しで
       前ページの子リストがそのまま続いていることを示す。この場合は110ptの
-      固定下駄を履かせず、そのままt0=0(実質フィルタ無し)を返す。
+      固定下駄を履かせず、縦罫線の上端(=表本体の上端)を返す。
       これにより、事業費支出や固定資産取得支出等の子科目リストがページ境界を
       またいだ際、continuation側先頭の行(top<110)が見出しと誤認されて
       抽出漏れになる問題を防ぐ。
+      (2026-07) 以前はここで 0(実質フィルタ無し)を返していたため、ページヘッダの
+      法人名が科目列に混入していた。法人名が全角スペースを含む場合(例
+      「社会福祉法人　慈照会」)は後半が別トークンになり x0 が科目列の範囲に入るため、
+      幽霊科目として拾われる(慈照会で42ページ・42行)。しかも stage が深く付くため、
+      直前の法人特有行が「子を持つ見出し」と誤判定されプール集計から落ちる二次被害も
+      生じていた。表本体の上端は継続ページでも縦罫線から取れる(慈照会では57.1、
+      法人名は24.2、最初の科目行は59.7)ので、罫線由来で正しく切れる。
+      手元11法人の継続ページ352ページで実測し、除去されるのは混入トークン42件のみで
+      正当な行は1件も切られないことを確認済み。
     - どちらの判定もできない場合は、安全側としてフォールバックの110を返す。
     """
     h_outer = [r['top'] for r in p.rects if r['height'] < 1.0 and abs(r['x0'] - 39.7) < 0.5]
@@ -285,7 +294,7 @@ def page_table_top(p):
         return h_outer[1]
     v_rules = [r['top'] for r in p.rects if r['width'] < 3 and r['height'] > 50]
     if v_rules and min(v_rules) < 60:
-        return 0
+        return min(v_rules)
     return 110
 
 
@@ -593,19 +602,27 @@ def _pool_amounts_by_parent(fac_rows):
             continue
         parent = r['pool_parent']
         nxt = fac_rows[i + 1] if i + 1 < n else None
-        is_header = bool(nxt and nxt['stage'] > r['stage'])
+        deeper = bool(nxt and nxt['stage'] > r['stage'])
+        # 直下明細の金額を先に集める。1件も金額が無ければ見出し扱いしない(2026-07)。
+        # 「深い行が続く」だけを条件にすると、金額を持たない行(空欄の定型行や、
+        # ページヘッダ混入のような幽霊行)が続いただけで親を見出しと誤判定し、
+        # 親の金額をプールから落としてしまう(慈照会: 電気料706,299が消えNG化)。
+        csum = 0
+        has_child_val = False
+        if deeper:
+            for j in range(i + 1, n):
+                r2 = fac_rows[j]
+                if r2['stage'] <= r['stage']:
+                    break
+                if (r2['stage'] == r['stage'] + 1 and r2['status'] == '法人特有'
+                        and r2['決算B'] is not None):
+                    csum += parse_amount(r2['決算B'])
+                    has_child_val = True
+        is_header = deeper and has_child_val
         if is_header:
             # 見出しは採用しない(明細側で拾う)。金額が明細合計と合わなければ警告。
             if r['決算B'] is not None:
                 own = parse_amount(r['決算B'])
-                csum = 0
-                for j in range(i + 1, n):
-                    r2 = fac_rows[j]
-                    if r2['stage'] <= r['stage']:
-                        break
-                    if (r2['stage'] == r['stage'] + 1 and r2['status'] == '法人特有'
-                            and r2['決算B'] is not None):
-                        csum += parse_amount(r2['決算B'])
                 if own != csum:
                     warnings.append(
                         f'{parent}: 法人特有見出し「{r["name"]}」={own:,} が '
